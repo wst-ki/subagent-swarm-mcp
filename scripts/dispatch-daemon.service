@@ -1,0 +1,27 @@
+# systemd user unit for the dispatch hub daemon (hub host).
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/dispatch-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now dispatch-daemon
+# Adjust the Node path, repo path (and HUB_REMOTE) below to your setup.
+
+[Unit]
+Description=Dispatch hub daemon (leases, local workers, acceptance, scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node %h/projects/glm-zcode-mcp/bin/dispatch.mjs daemon
+Restart=on-failure
+RestartSec=10
+# Environment=HUB_REMOTE=%h/dispatch/hub.git
+# Environment=ZCODE_MCP_PROJECT_DIR=%h/projects/subagents
+# Environment=HUB_WORK_RETENTION_DAYS=3
+# Environment=HUB_SUCCESS_RETENTION_HOURS=1
+# Environment=HUB_CLEANUP_INTERVAL_SEC=3600
+# Environment=HUB_CHECKOUT_MODE=worktree
+# Environment=HUB_WORKER_LOG_MAX_MB=10
+
+[Install]
+WantedBy=default.target

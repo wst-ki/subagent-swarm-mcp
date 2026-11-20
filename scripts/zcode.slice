@@ -1,0 +1,7 @@
+[Unit]
+Description=ZCode resource slice (hard RAM cap, zero swap)
+
+[Slice]
+MemoryHigh=5G
+MemoryMax=6G
+MemorySwapMax=0

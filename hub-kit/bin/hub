@@ -1,0 +1,369 @@
+#!/bin/sh
+# dispatch hub worker helper — POSIX sh + git + standard Unix tools only (macOS/Linux).
+# Runs inside the worker's clone of the hub. See PROTOCOL.md.
+#
+#   hub next <worker> [--wait SEC]     claim my oldest assigned task; prints TASK <id> <workdir> <task.md> or NONE
+#   hub say <worker> <id> <text...>    append a progress line, heartbeat, print unread INBOX lines
+#   hub inbox <worker> <id>            heartbeat + print unread INBOX lines (no progress line)
+#   hub done <worker> <id>             submit <workdir>/REPORT.md + work-repo diff; running -> done
+#   hub ask <worker> <id> <question>   running -> need-info
+#   hub fail <worker> <id> <reason>    running -> failed
+#   hub hb <worker>                    one heartbeat (force-push refs/hb/<worker>)
+set -eu
+
+PROG=$(basename "$0")
+HUB_DIR=${HUB_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
+HUB_WORK=${HUB_WORK:-$HOME/hub-work}
+# Host serving task repos: default to the host this hub clone was fetched from, so GUI agents
+# whose shells don't keep exported variables need no setup.
+if [ -z "${HUB_SSH_HOST:-}" ]; then
+  _u=$(git -C "$HUB_DIR" remote get-url origin 2>/dev/null || true)
+  case "$_u" in
+    ssh://*) _h=${_u#ssh://}; _h=${_h%%/*}; _h=${_h%%:*} ;;
+    /*|./*|../*|file://*) _h= ;;
+    *:*) _h=${_u%%:*} ;;
+    *) _h= ;;
+  esac
+  HUB_SSH_HOST=${_h:-}
+fi
+export GIT_AUTHOR_NAME=dispatch GIT_AUTHOR_EMAIL=dispatch@hub
+export GIT_COMMITTER_NAME=dispatch GIT_COMMITTER_EMAIL=dispatch@hub
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+set_actor() {
+  export GIT_AUTHOR_NAME="$WORKER" GIT_AUTHOR_EMAIL="$WORKER@hub"
+  export GIT_COMMITTER_NAME="$WORKER" GIT_COMMITTER_EMAIL="$WORKER@hub"
+}
+
+sync_hub() {
+  git -C "$HUB_DIR" fetch -q origin >/dev/null 2>&1 || return 1
+  git -C "$HUB_DIR" reset -q --hard origin/main >/dev/null 2>&1 || return 1
+  git -C "$HUB_DIR" clean -qfd >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# spec.json is written as one line, so these sed extractions are safe. Strings only / integers only.
+json_str() { sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" "$1" | head -n 1; }
+json_num() { sed -n "s/.*\"$2\":\([0-9][0-9]*\).*/\1/p" "$1" | head -n 1; }
+
+st_of() { cat "$HUB_DIR/tasks/$1/state" 2>/dev/null; }
+as_of() { cat "$HUB_DIR/tasks/$1/assignee" 2>/dev/null; }
+
+do_hb() {
+  _now=$(date +%s)
+  _tree=$(git -C "$HUB_DIR" mktree </dev/null 2>/dev/null) || return 1
+  _c=$(git -C "$HUB_DIR" commit-tree "$_tree" -m "$_now" 2>/dev/null) || return 1
+  _k=0
+  while [ "$_k" -lt 3 ]; do
+    # the same worker heartbeating from two places races on the ref lock; retry
+    if git -C "$HUB_DIR" push -q --force origin "$_c:refs/hb/$WORKER" >/dev/null 2>&1; then return 0; fi
+    _k=$(( _k + 1 ))
+    sleep 1
+  done
+  return 1
+}
+
+hb_pidfile() { printf '%s/.hb-%s.pid' "$HUB_WORK" "$WORKER"; }
+
+# Append one message to refs/<stream>/<id>: an empty-tree commit whose subject is the text,
+# pushed without --force; a lost race is retried after re-fetching the tip (same as the Node side).
+append_stream() { # append_stream <stream> <id> <text>
+  _ref="refs/$1/$2"
+  _msg=$3
+  _i=0
+  while [ "$_i" -lt 8 ]; do
+    _i=$(( _i + 1 ))
+    git -C "$HUB_DIR" fetch -q --force origin "+$_ref:$_ref" >/dev/null 2>&1 || true
+    _parent=$(git -C "$HUB_DIR" rev-parse -q --verify "$_ref" 2>/dev/null || :)
+    _tree=$(git -C "$HUB_DIR" mktree </dev/null 2>/dev/null) || return 1
+    if [ -n "$_parent" ]; then
+      _c=$(git -C "$HUB_DIR" commit-tree "$_tree" -p "$_parent" -m "$_msg" 2>/dev/null) || return 1
+    else
+      _c=$(git -C "$HUB_DIR" commit-tree "$_tree" -m "$_msg" 2>/dev/null) || return 1
+    fi
+    if git -C "$HUB_DIR" push -q origin "$_c:$_ref" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# Print INBOX lines not shown for this task yet (oldest first) and advance the seen marker kept
+# in .git, where it can never leak onto main. Lines: INBOX <YYYY-mm-dd HH:MM> <from>: <text>
+print_inbox() { # print_inbox <id>
+  _pdir="$HUB_DIR/.git/hub-inbox-seen"
+  mkdir -p "$_pdir" 2>/dev/null || return 0
+  _pf="$_pdir/$1"
+  _seen=$(cat "$_pf" 2>/dev/null || :)
+  _tmp="$_pdir/tmp.$$"
+  _iref="refs/inbox/$1"
+  git -C "$HUB_DIR" fetch -q --force origin "+$_iref:$_iref" >/dev/null 2>&1 || true
+  git -C "$HUB_DIR" log --reverse --format='%H|%ad|%an|%s' --date=format:'%Y-%m-%d %H:%M' "$_iref" >"$_tmp" 2>/dev/null || : >"$_tmp"
+  _skip=0
+  if [ -n "$_seen" ]; then _skip=1; fi
+  _newest=
+  while IFS='|' read -r _h _d _a _t; do
+    [ -n "$_h" ] || continue
+    if [ "$_skip" -eq 1 ]; then
+      if [ "$_h" = "$_seen" ]; then _skip=0; fi
+      continue
+    fi
+    printf 'INBOX %s %s: %s\n' "$_d" "$_a" "$_t"
+    _newest=$_h
+  done <"$_tmp"
+  rm -f "$_tmp"
+  if [ -n "$_newest" ]; then printf '%s\n' "$_newest" >"$_pf"; fi
+  return 0
+}
+
+start_hb() {
+  stop_hb || true
+  mkdir -p "$HUB_WORK" || return 1
+  _pf=$(hb_pidfile)
+  : > "$_pf"
+  ( while [ -f "$_pf" ]; do do_hb >/dev/null 2>&1 || true; sleep 30; done ) >/dev/null 2>&1 &
+  echo $! > "$_pf"
+}
+
+stop_hb() {
+  _pf=$(hb_pidfile)
+  if [ -f "$_pf" ]; then
+    _p=$(cat "$_pf" 2>/dev/null)
+    rm -f "$_pf"
+    if [ -n "$_p" ]; then kill "$_p" 2>/dev/null || true; fi
+  fi
+}
+
+# cas <fn>: same algorithm as the Node side — sync, re-check preconditions, write, commit, push;
+# a lost push race is retried up to 8 times. fn returns 0 (committed, push it), 2 (precondition
+# false), anything else (hard error).
+cas() {
+  _i=0
+  while [ "$_i" -lt 8 ]; do
+    _i=$(( _i + 1 ))
+    sync_hub || die "cannot sync hub at $HUB_DIR"
+    _rc=0
+    "$1" || _rc=$?
+    if [ "$_rc" -eq 2 ]; then return 2; fi
+    if [ "$_rc" -ne 0 ]; then return 1; fi
+    if _po=$(git -C "$HUB_DIR" push origin HEAD:main 2>&1); then
+      # we only push fresh commits; "up to date" means another writer pushed a byte-identical
+      # mutation first and we did not win it
+      case "$_po" in
+        *up-to-date*) return 2 ;;
+        *) return 0 ;;
+      esac
+    fi
+    sleep 1
+  done
+  die "hub push failed after 8 attempts"
+}
+
+commit_hub() { # commit_hub <message>
+  git -C "$HUB_DIR" add -A || return 1
+  git -C "$HUB_DIR" commit -q -m "$1" >/dev/null || return 1
+}
+
+try_claim() {
+  ID=
+  for _id in $(ls "$HUB_DIR/tasks" 2>/dev/null | LC_ALL=C sort); do
+    if [ ! -f "$HUB_DIR/tasks/$_id/spec.json" ]; then continue; fi
+    if [ "$(st_of "$_id")" != "assigned" ]; then continue; fi
+    if [ "$(as_of "$_id")" != "$WORKER" ]; then continue; fi
+    ID=$_id
+    break
+  done
+  if [ -z "$ID" ]; then return 2; fi
+  _sp="$HUB_DIR/tasks/$ID/spec.json"
+  _tm=$(json_num "$_sp" timeoutMin)
+  if [ -z "$_tm" ]; then _tm=45; fi
+  _att=$(cat "$HUB_DIR/tasks/$ID/attempts" 2>/dev/null | tr -cd 0-9)
+  if [ -z "$_att" ]; then _att=0; fi
+  printf 'running\n' > "$HUB_DIR/tasks/$ID/state"
+  printf '%s\n' "$WORKER" > "$HUB_DIR/tasks/$ID/assignee"
+  printf '%s\n' "$(( $(date +%s) + _tm * 60 ))" > "$HUB_DIR/tasks/$ID/lease"
+  printf '%s\n' "$(( _att + 1 ))" > "$HUB_DIR/tasks/$ID/attempts"
+  commit_hub "claim $ID $WORKER"
+}
+
+try_done() {
+  _st=$(st_of "$ID")
+  if [ "$_st" != "running" ]; then echo "task $ID is not running ($_st)" >&2; return 2; fi
+  if [ "$(as_of "$ID")" != "$WORKER" ]; then echo "task $ID is not yours" >&2; return 2; fi
+  if [ ! -f "$REPORT" ]; then echo "no REPORT.md at $REPORT" >&2; return 1; fi
+  mkdir -p "$HUB_DIR/tasks/$ID/result"
+  cp "$REPORT" "$HUB_DIR/tasks/$ID/result/report.md" || return 1
+  _base=$(json_str "$HUB_DIR/tasks/$ID/spec.json" base)
+  if [ -n "$_base" ] && [ -d "$WORKDIR/.git" ]; then
+    git -C "$WORKDIR" add -A -- . ':(exclude)REPORT.md' ':(exclude).hub-out.log' >/dev/null 2>&1 || return 1
+    git -C "$WORKDIR" diff --cached --binary "$_base" > "$HUB_DIR/tasks/$ID/result/patch.diff" || return 1
+  fi
+  printf 'done\n' > "$HUB_DIR/tasks/$ID/state"
+  : > "$HUB_DIR/tasks/$ID/lease"
+  commit_hub "report $ID $WORKER"
+}
+
+try_ask() {
+  _st=$(st_of "$ID")
+  if [ "$_st" != "running" ]; then return 2; fi
+  if [ "$(as_of "$ID")" != "$WORKER" ]; then return 2; fi
+  printf 'need-info\n' > "$HUB_DIR/tasks/$ID/state"
+  printf '%s\n' "$NOTE" > "$HUB_DIR/tasks/$ID/note"
+  : > "$HUB_DIR/tasks/$ID/lease"
+  commit_hub "ask $ID $WORKER"
+}
+
+try_fail() {
+  _st=$(st_of "$ID")
+  if [ "$_st" != "running" ]; then return 2; fi
+  if [ "$(as_of "$ID")" != "$WORKER" ]; then return 2; fi
+  printf 'failed\n' > "$HUB_DIR/tasks/$ID/state"
+  printf '%s\n' "${FAIL_NOTE:-failed by worker}" > "$HUB_DIR/tasks/$ID/note"
+  : > "$HUB_DIR/tasks/$ID/lease"
+  commit_hub "fail $ID $WORKER"
+}
+
+cmd_next() {
+  if [ $# -lt 1 ]; then die "usage: $PROG next <worker> [--wait SEC]"; fi
+  WORKER=$1
+  shift
+  set_actor
+  _wait=120
+  if [ "${1:-}" = "--wait" ]; then
+    if [ $# -lt 2 ]; then die "--wait needs a number of seconds"; fi
+    _wait=$2
+  fi
+  _deadline=$(( $(date +%s) + _wait ))
+  do_hb || die "heartbeat push failed (is the hub reachable?)"
+  _rc=1
+  while :; do
+    _rc=0
+    cas try_claim || _rc=$?
+    if [ "$_rc" -eq 0 ]; then break; fi
+    if [ "$_rc" -ne 2 ]; then die "claim attempt failed"; fi
+    _now=$(date +%s)
+    if [ "$_now" -ge "$_deadline" ]; then echo NONE; return 0; fi
+    do_hb >/dev/null 2>&1 || true
+    _rem=$(( _deadline - _now ))
+    if [ "$_rem" -gt 15 ]; then _rem=15; fi
+    sleep "$_rem"
+  done
+
+  _sp="$HUB_DIR/tasks/$ID/spec.json"
+  _kind=$(json_str "$_sp" kind)
+  _repo=$(json_str "$_sp" repo)
+  BASE=$(json_str "$_sp" base)
+  WORKDIR="$HUB_WORK/$ID"
+  mkdir -p "$HUB_WORK" || die "cannot create $HUB_WORK"
+  if [ "$_kind" = "code" ] && [ -n "$_repo" ]; then
+    _r=$_repo
+    if [ ! -e "$_r" ]; then
+      case "$_r" in
+        *://*|*:*) ;;
+        *)
+          [ -n "$HUB_SSH_HOST" ] || die "repo $_r is not local; set HUB_SSH_HOST (or clone the hub from an SSH remote)"
+          _r="$HUB_SSH_HOST:$_r"
+          ;;
+      esac
+    fi
+    rm -rf "$WORKDIR"
+    if ! git clone -q --no-checkout "$_r" "$WORKDIR" >&2; then
+      FAIL_NOTE="clone failed: $_r"
+      if cas try_fail; then :; fi
+      die "cannot clone $_r"
+    fi
+    if ! git -C "$WORKDIR" checkout -q --detach "${BASE:-HEAD}" >&2; then
+      FAIL_NOTE="checkout failed: ${BASE:-HEAD}"
+      if cas try_fail; then :; fi
+      die "cannot checkout ${BASE:-HEAD} in $WORKDIR"
+    fi
+  else
+    mkdir -p "$WORKDIR"
+  fi
+  start_hb
+  echo "TASK $ID $WORKDIR $HUB_DIR/tasks/$ID/task.md"
+  print_inbox "$ID"
+}
+
+cmd_done() {
+  if [ $# -ne 2 ]; then die "usage: $PROG done <worker> <id>"; fi
+  WORKER=$1
+  ID=$2
+  set_actor
+  WORKDIR="$HUB_WORK/$ID"
+  REPORT="$WORKDIR/REPORT.md"
+  if [ ! -f "$REPORT" ]; then
+    die "no REPORT.md in $WORKDIR — finish the work, write REPORT.md, then re-run"
+  fi
+  _rc=0
+  cas try_done || _rc=$?
+  if [ "$_rc" -ne 0 ]; then die "cannot submit $ID (state or owner changed)"; fi
+  stop_hb
+  echo "done $ID"
+}
+
+cmd_ask() {
+  if [ $# -lt 3 ]; then die "usage: $PROG ask <worker> <id> <question>"; fi
+  WORKER=$1
+  ID=$2
+  shift 2
+  set_actor
+  NOTE=$*
+  _rc=0
+  cas try_ask || _rc=$?
+  if [ "$_rc" -ne 0 ]; then die "cannot ask on $ID (it must be running and yours)"; fi
+  stop_hb
+  echo "asked $ID"
+}
+
+cmd_fail() {
+  if [ $# -lt 3 ]; then die "usage: $PROG fail <worker> <id> <reason>"; fi
+  WORKER=$1
+  ID=$2
+  shift 2
+  set_actor
+  FAIL_NOTE=$*
+  _rc=0
+  cas try_fail || _rc=$?
+  if [ "$_rc" -ne 0 ]; then die "cannot fail $ID (it must be running and yours)"; fi
+  stop_hb
+  echo "failed $ID"
+}
+
+cmd_say() {
+  if [ $# -lt 3 ]; then die "usage: $PROG say <worker> <id> <text...>"; fi
+  WORKER=$1
+  ID=$2
+  shift 2
+  set_actor
+  append_stream progress "$ID" "$*" || die "cannot append progress for $ID"
+  do_hb || die "heartbeat push failed"
+  print_inbox "$ID"
+}
+
+cmd_inbox() {
+  if [ $# -ne 2 ]; then die "usage: $PROG inbox <worker> <id>"; fi
+  WORKER=$1
+  ID=$2
+  set_actor
+  do_hb || die "heartbeat push failed"
+  print_inbox "$ID"
+}
+
+cmd_hb() {
+  if [ $# -ne 1 ]; then die "usage: $PROG hb <worker>"; fi
+  WORKER=$1
+  set_actor
+  do_hb || die "heartbeat push failed"
+}
+
+case "${1:-}" in
+  next) shift; cmd_next "$@" ;;
+  say) shift; cmd_say "$@" ;;
+  inbox) shift; cmd_inbox "$@" ;;
+  done) shift; cmd_done "$@" ;;
+  ask) shift; cmd_ask "$@" ;;
+  fail) shift; cmd_fail "$@" ;;
+  hb) shift; cmd_hb "$@" ;;
+  *) echo "usage: $PROG {next|say|inbox|done|ask|fail|hb} <worker> ..." >&2; exit 2 ;;
+esac

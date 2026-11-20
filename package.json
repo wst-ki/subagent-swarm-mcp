@@ -1,0 +1,43 @@
+{
+  "name": "subagent-swarm-mcp",
+  "version": "0.2.0",
+  "description": "Multi-CLI MCP server and structured microbatch toolkit (CodeBuddy CLI, Qoder CLI, ZCode desktop app, extensible backends) for delegating subtasks across coding CLI subscriptions",
+  "type": "module",
+  "bin": {
+    "subagent-swarm-mcp": "src/server.mjs",
+    "glm-zcode-mcp": "src/server.mjs",
+    "swarm": "bin/swarm.mjs",
+    "dispatch": "bin/dispatch.mjs",
+    "zcode-watch": "bin/zcode-watch.mjs",
+    "zcode": "bin/zcode.mjs",
+    "codebuddy-usage": "bin/codebuddy-usage.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "e2e": "node e2e/scenario1.mjs",
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wst-ki/subagent-swarm-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "subagent",
+    "codebuddy",
+    "qoder",
+    "zcode",
+    "glm",
+    "claude-code",
+    "codex",
+    "antigravity"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.7"
+  }
+}

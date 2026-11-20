@@ -1,0 +1,23 @@
+[Unit]
+Description=ZCode on a virtual display for glm-zcode-mcp
+After=network-online.target
+
+[Service]
+Type=simple
+Slice=zcode.slice
+ExecStart=%h/projects/glm-zcode-mcp/scripts/zcode-headless.sh
+MemoryHigh=5G
+MemoryMax=6G
+MemorySwapMax=0
+OOMPolicy=kill
+OOMScoreAdjust=500
+KillMode=control-group
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

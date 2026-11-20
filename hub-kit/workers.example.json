@@ -1,0 +1,18 @@
+{
+  "workers": [
+    { "id": "local-zcode-glm53", "kind": "zcode", "host": "local", "vendor": "zhipu", "model": "GLM-5.3",
+      "provider": "account%3Abigmodel-individual-coding-plan",
+      "tier": "high", "maxParallel": 2, "enabled": true, "kinds": ["code", "text", "review"], "costRank": 1 },
+    { "id": "local-zcode-glm53-startplan", "kind": "zcode", "host": "local", "vendor": "zhipu", "model": "GLM-5.3",
+      "provider": "account%3Abigmodel-start-plan",
+      "tier": "mid", "maxParallel": 1, "enabled": false, "kinds": ["code", "text", "review"], "costRank": 3 },
+    { "id": "local-codex", "kind": "cli", "host": "local", "vendor": "openai", "model": "gpt-6.1-sol", "tier": "high",
+      "maxParallel": 1, "enabled": true, "kinds": ["code", "text", "review"], "costRank": 2,
+      "cmd": ["codex", "exec", "-s", "workspace-write", "--skip-git-repo-check", "-m", "gpt-6.1-sol", "{prompt}"] },
+    { "id": "local-codebuddy", "kind": "cli", "host": "local", "vendor": "deepseek", "model": "deepseek-v4.1-flash",
+      "tier": "mid", "maxParallel": 2, "enabled": true, "kinds": ["code", "text", "review"], "costRank": 1,
+      "cmd": ["codebuddy", "-p", "-y", "--model", "deepseek-v4.1-flash", "{prompt}"] },
+    { "id": "remote-codex", "kind": "manual", "host": "remote", "vendor": "openai", "model": "gpt-6.1-sol", "tier": "high",
+      "maxParallel": 1, "enabled": true, "kinds": ["code", "text", "review"], "costRank": 2 }
+  ]
+}
