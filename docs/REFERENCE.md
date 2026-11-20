@@ -11,7 +11,7 @@ Detailed specification for **subagent-swarm-mcp** (legacy bin `glm-zcode-mcp`) M
 | Tool | Purpose |
 |---|---|
 | `swarm_backends {}` | Inspect registered backends (`codebuddy`, `qoder`, `zcode`), binary/CDP availability, profiles, allowed models, and running/max concurrency. |
-| `swarm_run {prompt, backend?, model?, fallbackModel?, profile?, cwd?, provider?, ephemeral?, waitSec?}` | Run a task on `auto` (default), `codebuddy`, `qoder`, or `zcode`. CLI backends default to `profile: "lite"` (zero tools); set `waitSec` (1–55) for single-call inline completion. |
+| `swarm_run {prompt, backend?, model?, fallbackModel?, profile?, cwd?, provider?, effort?, maxTurns?, systemPrompt?, appendSystemPrompt?, addDirs?, ephemeral?, waitSec?}` | Run a task on `auto` (default), `codebuddy`, `qoder`, or `zcode`. CLI backends default to `profile: "lite"` (zero tools + lean system prompt on CodeBuddy); `effort` (`minimal`..`max`), `maxTurns` (1..100), `systemPrompt`/`appendSystemPrompt`, and `addDirs` configure CodeBuddy CLI directly; set `waitSec` (1–55) for single-call inline completion. |
 | `swarm_wait {taskId, timeoutSec?}` | Block up to 55 s on any `cb_*`, `qd_*`, or `sess_*` task and return final result/usage when done. |
 | `swarm_status {taskId}` | Non-blocking status with live tool tracking and automatic dead-worker reconciliation. |
 | `swarm_result {taskId}` | Return final answer, model metadata, and token/credit usage (`cb_*`, `qd_*`, or `sess_*`). |
@@ -82,9 +82,9 @@ Detailed specification for **subagent-swarm-mcp** (legacy bin `glm-zcode-mcp`) M
 
 | Profile | CLI Flags | Capabilities |
 |---|---|---|
-| `lite` (default) | `--tools "" --mcp-config '{"mcpServers":{}}' --strict-mcp-config` | Zero tools, no MCP servers, memory-guard prefix on free-form prompts. Lowest token/credit cost; best for pure reasoning and `ZCODE_STRUCTURED_V1` single-turn extraction (intentionally avoids `--json-schema` which conflicts with `--tools ""`). |
-| `readonly` | `--tools Read,ViewImage,Glob,Grep,WebSearch,WebFetch --allowedTools Read,ViewImage,Glob,Grep,WebSearch,WebFetch --mcp-config '{"mcpServers":{}}' --strict-mcp-config -y` | Non-destructive codebase/image/web inspection in `cwd`. |
-| `workspace` | `-y` | Full built-in + configured MCP workspace access inside `cwd`. |
+| `lite` (default) | `--tools "" --mcp-config '{"mcpServers":{}}' --strict-mcp-config --system-prompt "..."` | Zero tools, no MCP servers, lean pure-text `--system-prompt` (cuts baseline input tokens ~57%; disable via `systemPrompt: false` or `CODEBUDDY_LITE_SYSTEM_PROMPT=off`), plus memory-guard prefix on free-form prompts. Lowest token/credit cost; best for pure reasoning and `ZCODE_STRUCTURED_V1` single-turn extraction (intentionally avoids `--json-schema` which conflicts with `--tools ""`). Silent zero-token empty responses fail closed as `empty_response`. |
+| `readonly` | `--tools Read,ViewImage,Glob,Grep,WebSearch,WebFetch --allowedTools Read,ViewImage,Glob,Grep,WebSearch,WebFetch --mcp-config '{"mcpServers":{}}' --strict-mcp-config -y [--add-dir ...]` | Non-destructive codebase/image/web inspection in `cwd` (plus optional `addDirs`, `effort`, and `maxTurns` loop guard). |
+| `workspace` | `-y [--add-dir ...]` | Full built-in + configured MCP workspace access inside `cwd` (plus optional `addDirs`, `effort`, and `maxTurns`). |
 
 Default model: `hy4flash-free`. Other supported models include `hy4flash`, `hy4std`, `deepseek-v4.1-flash`, `glm-5.3`, `glm-5.3-flash`, `glm-5.2`, `space-bunny`, `minimax-m3.1-flash`, `minimax-m2.7`, `kimi-k3.1-pro`, `kimi-k3-1`, `kimi-k2.8-preview`, `deepseek-v4-pro`, `step-5-preview`, and `mimo-v2.6-pro`.
 
@@ -167,6 +167,9 @@ All binaries are exposed via `package.json` `bin` (or `node bin/<name>.mjs`):
 | `CODEBUDDY_PROJECTS_DIR` | `~/.codebuddy/projects` | CodeBuddy CLI transcript root |
 | `CODEBUDDY_RUNS_DIR` | `<stateDir>/cb-runs` | Swarm CodeBuddy run state directory merged into `codebuddy-usage` |
 | `CODEBUDDY_EXPIRING_SOON_DAYS` | `7` | Window (days) for highlighting expiring active credit packages |
+| `CODEBUDDY_PREFER_WHEN_EXPIRING` | `1` (enabled) | In `backend: "auto"`, prefer CodeBuddy while cached expiring credits & free slots exist (`0` disables) |
+| `CODEBUDDY_LITE_SYSTEM_PROMPT` | built-in lean prompt | Override CodeBuddy `lite` `--system-prompt`, or `off` to disable |
+| `CODEBUDDY_DEFAULT_EFFORT` | unset | Default CodeBuddy `--effort` (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`) |
 | `CODEBUDDY_API_BASE` | `https://www.workbuddy.cn` | Use `https://www.workbuddy.ai` for international |
 | `QODER_BIN` | auto-discovered | Explicit path to `qodercli` binary |
 | `QODER_DEFAULT_MODEL` | `DeepSeek-Flash` | Default Qoder CLI model |

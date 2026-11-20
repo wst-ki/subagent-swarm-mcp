@@ -2,6 +2,7 @@
 // Keeps zcode, codebuddy, and qoder uniformly addressable via taskId prefixes and routes
 // `backend: "auto"` requests by constraints, model match, health, and free capacity.
 import { resolve } from "node:path";
+import { readCachedExpiringCredit } from "../codebuddy-usage.mjs";
 import { config } from "../config.mjs";
 import * as codebuddy from "./codebuddy.mjs";
 import * as qoder from "./qoder.mjs";
@@ -68,7 +69,12 @@ export async function listBackends({ env = process.env, backends = BACKENDS } = 
   };
 }
 
-function pickBestHealthy(names, backends, healthMap, env) {
+function pickBestHealthy(names, backends, healthMap, env, { preferCodebuddy = false } = {}) {
+  if (preferCodebuddy && names.includes("codebuddy") && backends.codebuddy && healthMap.codebuddy?.ok) {
+    const h = healthMap.codebuddy;
+    const cbFree = Math.max(0, (h.maxRunning ?? getBackendMaxRunning(backends.codebuddy, env)) - (h.runningTasks ?? 0));
+    if (cbFree > 0) return { best: backends.codebuddy, bestFree: cbFree };
+  }
   let best = null;
   let bestFree = -1;
   for (const name of names) {
@@ -84,6 +90,14 @@ function pickBestHealthy(names, backends, healthMap, env) {
   return { best, bestFree };
 }
 
+function shouldPreferExpiringCodebuddy(env) {
+  if (env?.CODEBUDDY_PREFER_WHEN_EXPIRING === "0" || env?.CODEBUDDY_PREFER_WHEN_EXPIRING === "false") {
+    return false;
+  }
+  const stateDir = env?.ZCODE_MCP_STATE_DIR?.trim() || config.stateDir;
+  return readCachedExpiringCredit({ stateDir }).credit > 0;
+}
+
 export async function selectBackend({
   backend = "auto",
   model = null,
@@ -91,6 +105,12 @@ export async function selectBackend({
   cwd = null,
   ephemeral = false,
   provider = null,
+  effort = null,
+  maxTurns = null,
+  systemPrompt = undefined,
+  appendSystemPrompt = null,
+  addDirs = null,
+  preferExpiringCodebuddy = undefined,
   env = process.env,
   backends = BACKENDS,
 } = {}) {
@@ -107,6 +127,19 @@ export async function selectBackend({
     return backends.zcode;
   }
 
+  // CodeBuddy-specific CLI controls route directly to CodeBuddy when backend="auto".
+  const needsCodebuddyFeatures = Boolean(
+    effort ||
+      maxTurns !== null && maxTurns !== undefined ||
+      systemPrompt !== undefined ||
+      appendSystemPrompt ||
+      (Array.isArray(addDirs) && addDirs.length > 0),
+  );
+  if (needsCodebuddyFeatures && backends.codebuddy) {
+    return backends.codebuddy;
+  }
+
+  const preferCb = preferExpiringCodebuddy ?? shouldPreferExpiringCodebuddy(env);
   const hasCustomCwd = Boolean(cwd && resolve(cwd) !== resolve(config.projectDir));
   const needsCliFeatures = profile === "lite" || profile === "readonly" || Boolean(ephemeral) || hasCustomCwd;
 
@@ -122,7 +155,7 @@ export async function selectBackend({
       const subsetHealth = Object.fromEntries(
         await Promise.all(modelMatches.map(async (n) => [n, await safeHealth(backends[n], env)])),
       );
-      const { best } = pickBestHealthy(modelMatches, backends, subsetHealth, env);
+      const { best } = pickBestHealthy(modelMatches, backends, subsetHealth, env, { preferCodebuddy: preferCb });
       if (best) return best;
       return backends[modelMatches[0]];
     }
@@ -134,7 +167,7 @@ export async function selectBackend({
   const healthMap = Object.fromEntries(healthPairs);
 
   if (needsCliFeatures) {
-    const { best, bestFree } = pickBestHealthy(eligibleByConstraint, backends, healthMap, env);
+    const { best, bestFree } = pickBestHealthy(eligibleByConstraint, backends, healthMap, env, { preferCodebuddy: preferCb });
     if (best && (bestFree > 0 || eligibleByConstraint.length === 1)) return best;
     if (best) return best;
     const cliReasons = eligibleByConstraint
@@ -151,7 +184,14 @@ export async function selectBackend({
     );
   }
 
-  // General auto routing: pick healthy backend with capacity (prefer ties by codebuddy -> qoder -> zcode).
+  // General auto routing: if CodeBuddy has expiring-soon credits and free slots, consume them first;
+  // otherwise pick healthy backend with most free capacity (ties: codebuddy -> qoder -> zcode).
+  if (preferCb && activeOrder.includes("codebuddy") && healthMap.codebuddy?.ok) {
+    const h = healthMap.codebuddy;
+    const cbFree = Math.max(0, (h.maxRunning ?? getBackendMaxRunning(backends.codebuddy, env)) - (h.runningTasks ?? 0));
+    if (cbFree > 0) return backends.codebuddy;
+  }
+
   let chosen = null;
   let chosenFree = 0;
   for (const n of activeOrder) {
@@ -188,6 +228,11 @@ export async function swarmRun({
   cwd = undefined,
   provider = undefined,
   ephemeral = false,
+  effort = undefined,
+  maxTurns = undefined,
+  systemPrompt = undefined,
+  appendSystemPrompt = undefined,
+  addDirs = undefined,
   waitSec = 0,
   contract = null,
   onProgress = null,
@@ -201,6 +246,11 @@ export async function swarmRun({
     cwd,
     ephemeral,
     provider,
+    effort,
+    maxTurns,
+    systemPrompt,
+    appendSystemPrompt,
+    addDirs,
     env,
     backends,
   });
@@ -216,6 +266,11 @@ export async function swarmRun({
     cwd,
     provider,
     ephemeral,
+    effort,
+    maxTurns,
+    systemPrompt,
+    appendSystemPrompt,
+    addDirs,
     contract,
     env,
   });
@@ -261,11 +316,13 @@ export async function swarmFollowUp({
   prompt,
   model = undefined,
   fallbackModel = undefined,
+  effort = undefined,
+  maxTurns = undefined,
   env = process.env,
   backends = BACKENDS,
 } = {}) {
   const adapter = backendForTaskId(taskId, { backends });
-  return adapter.followUp({ taskId, prompt, model, fallbackModel, env });
+  return adapter.followUp({ taskId, prompt, model, fallbackModel, effort, maxTurns, env });
 }
 
 export async function swarmCancel(taskId, { env = process.env, backends = BACKENDS } = {}) {

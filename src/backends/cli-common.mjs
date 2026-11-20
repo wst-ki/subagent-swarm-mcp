@@ -65,6 +65,9 @@ export function sumUsageList(list) {
 }
 
 export function classifyCliError(message = "") {
+  if (/empty zero-token response|empty response/i.test(message)) {
+    return "empty_response";
+  }
   if (/quota|rate.limit|429|credit|insufficient|balance|额度|限流|不足/i.test(message)) {
     return "quota_or_rate_limit";
   }

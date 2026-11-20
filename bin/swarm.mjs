@@ -20,12 +20,13 @@ import { exportBatchValidItems, readBatchStatus, runStructuredBatch } from "../s
 const USAGE = `usage: swarm <command>
   backends                 inspect registered backends (codebuddy, qoder, zcode) and health
   run (--file F | --text T | stdin) [--backend auto|codebuddy|qoder|zcode] [--profile lite|readonly|workspace]
-      [--cwd DIR] [--model M] [--fallback-model M] [--provider KEY] [--ephemeral] [--wait [SEC]]
+      [--cwd DIR] [--model M] [--fallback-model M] [--provider KEY] [--effort minimal|low|medium|high|xhigh|max]
+      [--max-turns N] [--system-prompt TEXT] [--append-system-prompt TEXT] [--add-dir D1,D2] [--ephemeral] [--wait [SEC]]
   run-structured --task T --schema JSON_OR_FILE --input JSON_OR_FILE [--domain-rule R]
-      [--backend auto|codebuddy|qoder|zcode] [--profile P] [--cwd DIR] [--model M] [--ephemeral] [--wait [SEC]]
+      [--backend auto|codebuddy|qoder|zcode] [--profile P] [--cwd DIR] [--model M] [--effort L] [--max-turns N] [--ephemeral] [--wait [SEC]]
   structured-result <taskId> [--domain-rule R]
   batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1]
-      [--backend auto|codebuddy|qoder|zcode] [--profile P] [--cwd DIR] [--model M] [--provider KEY]
+      [--backend auto|codebuddy|qoder|zcode] [--profile P] [--cwd DIR] [--model M] [--provider KEY] [--effort L] [--max-turns N]
       [--concurrency N] [--reserve-slots N] [--max-credit N] [--max-batch-chars N] [--timeout-ms MS]
       [--capacity-wait-ms MS] [--state-dir DIR] [--ephemeral] [--export OUT_FILE] [--summary OUT_FILE] [--compact]
   batch-status <batchId> [--state-dir DIR] [--compact]
@@ -33,7 +34,7 @@ const USAGE = `usage: swarm <command>
   wait <taskId> [timeoutSec]
   status <taskId>
   result <taskId>
-  followup <taskId> (--file F | --text T | stdin) [--model M] [--fallback-model M]
+  followup <taskId> (--file F | --text T | stdin) [--model M] [--fallback-model M] [--effort L] [--max-turns N]
   cancel <taskId>
   list [N] [--backend all|codebuddy|qoder|zcode]
   quota [--backend all|codebuddy|qoder|zcode] [--refresh] [--days N]`;
@@ -47,6 +48,11 @@ const VALUE_FLAGS = new Set([
   "--model",
   "--fallback-model",
   "--provider",
+  "--effort",
+  "--max-turns",
+  "--system-prompt",
+  "--append-system-prompt",
+  "--add-dir",
   "--task",
   "--schema",
   "--input",
@@ -119,6 +125,14 @@ async function readStdinText() {
 const { flags, bools, positionals } = parseOptions(rest);
 const flag = (name) => flags.get(name);
 const numFlag = (name) => (flags.has(name) ? Number(flags.get(name)) : undefined);
+const listFlag = (name) =>
+  flags.has(name)
+    ? flags
+        .get(name)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : undefined;
 const pos = (idx = 0, label = "taskId / batchId") =>
   positionals[idx] ?? die(`${label} required`);
 
@@ -171,6 +185,11 @@ const commands = {
       model: flag("--model"),
       fallbackModel: flag("--fallback-model"),
       provider: flag("--provider"),
+      effort: flag("--effort"),
+      maxTurns: numFlag("--max-turns"),
+      systemPrompt: flag("--system-prompt"),
+      appendSystemPrompt: flag("--append-system-prompt"),
+      addDirs: listFlag("--add-dir"),
       ephemeral: bools.has("--ephemeral"),
       waitSec: numFlag("--wait") ?? 0,
     }),
@@ -186,6 +205,11 @@ const commands = {
       model: flag("--model"),
       fallbackModel: flag("--fallback-model"),
       provider: flag("--provider"),
+      effort: flag("--effort"),
+      maxTurns: numFlag("--max-turns"),
+      systemPrompt: flag("--system-prompt"),
+      appendSystemPrompt: flag("--append-system-prompt"),
+      addDirs: listFlag("--add-dir"),
       ephemeral: bools.has("--ephemeral"),
       waitSec: numFlag("--wait") ?? 0,
     }),
@@ -236,6 +260,11 @@ const commands = {
       profile: flag("--profile"),
       cwd: flag("--cwd"),
       ephemeral: bools.has("--ephemeral"),
+      effort: flag("--effort"),
+      maxTurns: numFlag("--max-turns"),
+      systemPrompt: flag("--system-prompt"),
+      appendSystemPrompt: flag("--append-system-prompt"),
+      addDirs: listFlag("--add-dir"),
       model: flag("--model"),
       provider: flag("--provider"),
     });
@@ -306,6 +335,8 @@ const commands = {
       prompt: await promptArg(),
       model: flag("--model"),
       fallbackModel: flag("--fallback-model"),
+      effort: flag("--effort"),
+      maxTurns: numFlag("--max-turns"),
     }),
   cancel: () => swarmCancel(pos(0)),
   list: () => {

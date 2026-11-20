@@ -126,6 +126,43 @@ test("selectBackend routes by constraints, models, provider, and free capacity",
 
   // Explicit unknown backend rejects
   await assert.rejects(() => selectBackend({ backend: "unknown", backends }), /Unknown backend/);
+
+  // CodeBuddy-specific controls (effort/maxTurns) route to codebuddy automatically
+  assert.equal((await selectBackend({ backend: "auto", effort: "minimal", backends: three.backends })).id, "codebuddy");
+  assert.equal((await selectBackend({ backend: "auto", maxTurns: 3, backends: three.backends })).id, "codebuddy");
+
+  // Expiring-credit-aware auto routing: prefers codebuddy (free=2) over qoder (free=4) when cached credits expire soon
+  const expTmp = makeTempDir("exp-route-");
+  try {
+    const soonIso = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    writeFileSync(
+      join(expTmp, "codebuddy-usage.json"),
+      JSON.stringify({
+        fetchedAt: Date.now(),
+        remote: {
+          remain: 200,
+          total: 200,
+          pct: 100,
+          packages: [{ name: "expiring-pkg", remain: 200, size: 200, expires: soonIso }],
+        },
+      }),
+    );
+    const partialBusy = makeFakeBackends({
+      includeQoder: true,
+      cbHealth: { ok: true, available: true, backend: "codebuddy", maxRunning: 4, runningTasks: 2 },
+      qdHealth: { ok: true, available: true, backend: "qoder", maxRunning: 4, runningTasks: 0 },
+      zcHealth: { ok: true, available: true, backend: "zcode", maxRunning: 3, runningTasks: 0 },
+    });
+    const envWithExp = { ...process.env, ZCODE_MCP_STATE_DIR: expTmp };
+    assert.equal((await selectBackend({ backend: "auto", env: envWithExp, backends: partialBusy.backends })).id, "codebuddy");
+    // Opt-out via CODEBUDDY_PREFER_WHEN_EXPIRING=0 falls back to max-free backend (qoder)
+    assert.equal(
+      (await selectBackend({ backend: "auto", env: { ...envWithExp, CODEBUDDY_PREFER_WHEN_EXPIRING: "0" }, backends: partialBusy.backends })).id,
+      "qoder",
+    );
+  } finally {
+    rmSync(expTmp, { recursive: true, force: true });
+  }
 });
 
 test("swarmRun supports inline waitSec, default lite on codebuddy, swarmList & swarmQuota", async () => {

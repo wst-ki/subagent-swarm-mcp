@@ -30,7 +30,7 @@ import {
   swarmWait,
 } from "./backends/registry.mjs";
 
-const server = new McpServer({ name: "subagent-swarm-mcp", version: "0.3.0" });
+const server = new McpServer({ name: "subagent-swarm-mcp", version: "0.3.1" });
 
 const ok = (obj) => ({ content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: `Error: ${e?.message ?? e}` }] });
@@ -579,6 +579,7 @@ const swarmTaskId = z
   .regex(/^(sess(ion)?_[\w-]+|cb_[\w-]+|qd_[\w-]+)$/, "taskId (cb_*, qd_*, or sess_*) returned by swarm_run / zcode_run");
 const swarmBackend = z.enum(["auto", "zcode", "codebuddy", "qoder"]);
 const swarmProfile = z.enum(["lite", "readonly", "workspace"]);
+const swarmEffort = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
 const swarmModel = z.string().min(1).max(120);
 
 function makeProgressReporter(extra) {
@@ -625,6 +626,11 @@ server.registerTool(
       profile: swarmProfile.optional().describe("Tool/permission profile: lite (default on CLI backends), readonly, or workspace."),
       cwd: z.string().min(1).max(1024).optional().describe("Working directory for CLI backends (must exist)."),
       provider: z.string().optional().describe("ZCode-only billing route override."),
+      effort: swarmEffort.optional().describe("CodeBuddy reasoning effort level (minimal/low/medium/high/xhigh/max)."),
+      maxTurns: z.number().int().min(1).max(100).optional().describe("CodeBuddy maximum agentic turn cap (1..100)."),
+      systemPrompt: z.union([z.string().max(16000), z.literal(false)]).optional().describe("Override CodeBuddy system prompt (or false to disable lean lite prompt)."),
+      appendSystemPrompt: z.string().max(16000).optional().describe("Append extra text to CodeBuddy's system prompt."),
+      addDirs: z.array(z.string().min(1).max(1024)).max(16).optional().describe("Additional directories accessible to CodeBuddy in readonly/workspace mode."),
       ephemeral: z.boolean().optional().describe("Disable session persistence on CLI backends (--no-session-persistence)."),
       waitSec: z.number().int().min(0).max(55).optional().describe("Wait up to N seconds inline (0 = async return immediately, max 55)."),
     },
@@ -691,6 +697,8 @@ server.registerTool(
       prompt: z.string().min(1),
       model: swarmModel.optional(),
       fallbackModel: swarmModel.optional(),
+      effort: swarmEffort.optional(),
+      maxTurns: z.number().int().min(1).max(100).optional(),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   },
@@ -752,6 +760,11 @@ server.registerTool(
       backend: swarmBackend.optional(),
       profile: swarmProfile.optional(),
       cwd: z.string().min(1).max(1024).optional(),
+      effort: swarmEffort.optional(),
+      maxTurns: z.number().int().min(1).max(100).optional(),
+      systemPrompt: z.union([z.string().max(16000), z.literal(false)]).optional(),
+      appendSystemPrompt: z.string().max(16000).optional(),
+      addDirs: z.array(z.string().min(1).max(1024)).max(16).optional(),
       ephemeral: z.boolean().optional(),
       waitSec: z.number().int().min(0).max(55).optional(),
       model: swarmModel.optional(),
@@ -798,6 +811,11 @@ server.registerTool(
       backend: swarmBackend.optional(),
       profile: swarmProfile.optional(),
       cwd: z.string().min(1).max(1024).optional(),
+      effort: swarmEffort.optional(),
+      maxTurns: z.number().int().min(1).max(100).optional(),
+      systemPrompt: z.union([z.string().max(16000), z.literal(false)]).optional(),
+      appendSystemPrompt: z.string().max(16000).optional(),
+      addDirs: z.array(z.string().min(1).max(1024)).max(16).optional(),
       ephemeral: z.boolean().optional(),
       model: swarmModel.optional(),
       provider: z.string().optional(),

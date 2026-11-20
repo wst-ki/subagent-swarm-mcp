@@ -6,8 +6,10 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import {
   buildCliArgs,
   cancel,
+  classifyCliError,
   codebuddySessionFile,
   cwdSlug,
+  DEFAULT_LITE_SYSTEM_PROMPT,
   followUp,
   health,
   inspectSessionJsonl,
@@ -205,7 +207,7 @@ test("preparePrompt guards lite free-form prompts while keeping structured line 
   assert.throws(() => preparePrompt("   ", { profile: "lite" }), /empty/);
 });
 
-test("buildCliArgs covers lite, readonly, workspace, resume, and ephemeral modes", () => {
+test("buildCliArgs covers lite lean system-prompt, effort, maxTurns, addDirs, readonly, workspace, resume, and ephemeral modes", () => {
   const lite = buildCliArgs({ taskId: "cb_1", profile: "lite", model: "hy4flash-free" });
   assert.deepEqual(lite, [
     "-p",
@@ -218,24 +220,58 @@ test("buildCliArgs covers lite, readonly, workspace, resume, and ephemeral modes
     "--mcp-config",
     '{"mcpServers":{}}',
     "--strict-mcp-config",
+    "--system-prompt",
+    DEFAULT_LITE_SYSTEM_PROMPT,
     "--model",
     "hy4flash-free",
   ]);
 
-  const ro = buildCliArgs({ taskId: "cb_2", profile: "readonly", model: "hy4std", fallbackModel: "hy4flash-free" });
+  const liteNoSp = buildCliArgs({
+    taskId: "cb_1b",
+    profile: "lite",
+    systemPrompt: false,
+    effort: "minimal",
+    maxTurns: 2,
+    appendSystemPrompt: "extra",
+    addDirs: ["/ignored/in/lite"],
+  });
+  assert.equal(liteNoSp.includes("--system-prompt"), false);
+  assert.ok(liteNoSp.includes("--effort"));
+  assert.equal(liteNoSp[liteNoSp.indexOf("--effort") + 1], "minimal");
+  assert.equal(liteNoSp[liteNoSp.indexOf("--max-turns") + 1], "2");
+  assert.equal(liteNoSp[liteNoSp.indexOf("--append-system-prompt") + 1], "extra");
+  assert.equal(liteNoSp.includes("--add-dir"), false);
+
+  const ro = buildCliArgs({
+    taskId: "cb_2",
+    profile: "readonly",
+    model: "hy4std",
+    fallbackModel: "hy4flash-free",
+    effort: "low",
+    maxTurns: 8,
+    addDirs: ["/dir/a", "/dir/b"],
+  });
   assert.ok(ro.includes("--tools"));
   assert.ok(ro.includes("--allowedTools"));
   assert.ok(ro.includes("--strict-mcp-config"));
   assert.ok(ro.includes("-y"));
   assert.ok(ro.includes("--fallback-model"));
+  assert.equal(ro[ro.indexOf("--effort") + 1], "low");
+  assert.equal(ro[ro.indexOf("--max-turns") + 1], "8");
+  const adIdx = ro.indexOf("--add-dir");
+  assert.deepEqual(ro.slice(adIdx + 1, adIdx + 3), ["/dir/a", "/dir/b"]);
 
   const ws = buildCliArgs({ profile: "workspace", ephemeral: true });
   assert.deepEqual(ws, ["-p", "--output-format", "json", "--no-session-persistence", "-y"]);
 
-  const res = buildCliArgs({ taskId: "cb_1", profile: "lite", resume: true });
+  const res = buildCliArgs({ taskId: "cb_1", profile: "lite", resume: true, effort: "high" });
   assert.deepEqual(res.slice(0, 5), ["-p", "--output-format", "json", "-r", "cb_1"]);
+  assert.equal(res.includes("--system-prompt"), false);
+  assert.equal(res[res.indexOf("--effort") + 1], "high");
 
   assert.throws(() => buildCliArgs({ taskId: "cb_1", profile: "admin" }), /Unsupported profile/);
+  assert.throws(() => buildCliArgs({ taskId: "cb_1", profile: "lite", effort: "turbo" }), /Unsupported effort/);
+  assert.throws(() => buildCliArgs({ taskId: "cb_1", profile: "lite", maxTurns: 0 }), /maxTurns/);
 });
 
 test("parseCodebuddyJsonOutput deduplicates rawUsage by messageId and handles errors", () => {
@@ -302,6 +338,21 @@ test("parseCodebuddyJsonOutput deduplicates rawUsage by messageId and handles er
   assert.equal(pdParsed.model, "deepseek-v4.1-flash");
   assert.equal(pdParsed.usage.reasoningTokens, 45);
   assert.equal(pdParsed.usage.credit, 0.12);
+
+  // Silent empty zero-token response with subtype="success" must fail closed as empty_response
+  const emptyParsed = parseCodebuddyJsonOutput(JSON.stringify([
+    {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "",
+      duration_ms: 244,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  ]));
+  assert.equal(emptyParsed.ok, false);
+  assert.equal(emptyParsed.isError, true);
+  assert.equal(classifyCliError(emptyParsed.errors.join("; ")), "empty_response");
 });
 
 test("inspectSessionJsonl tracks active tool calls and honors fromOffset", () => {

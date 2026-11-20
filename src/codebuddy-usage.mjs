@@ -292,6 +292,65 @@ function extractStateUsageTokens(u) {
   };
 }
 
+function summarizeLatencies(samples) {
+  if (!samples || samples.length === 0) return null;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const sum = sorted.reduce((acc, v) => acc + v, 0);
+  const pick = (q) => sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * q))];
+  return {
+    samples: sorted.length,
+    avg: Math.round(sum / sorted.length),
+    p50: Math.round(pick(0.5)),
+    p95: Math.round(pick(0.95)),
+    max: Math.round(sorted[sorted.length - 1]),
+  };
+}
+
+function buildCbBatchIndex(batchesDir) {
+  const map = new Map();
+  if (!batchesDir || !existsSync(batchesDir)) return map;
+  for (const batchId of readdirSync(batchesDir)) {
+    const rp = join(batchesDir, batchId, "results.jsonl");
+    if (!existsSync(rp)) continue;
+    try {
+      for (const line of readFileSync(rp, "utf8").split("\n")) {
+        if (!line.includes('"cb_')) continue;
+        try {
+          const rec = JSON.parse(line);
+          if (typeof rec?.taskId === "string" && rec.taskId.startsWith("cb_")) {
+            map.set(rec.taskId, batchId);
+          }
+        } catch {
+          // ignore malformed line
+        }
+      }
+    } catch {
+      // ignore unreadable batch file
+    }
+  }
+  return map;
+}
+
+export function readCachedExpiringCredit({
+  stateDir = config.stateDir,
+  cacheFile = null,
+  now = Date.now(),
+  expiringSoonDays = cbConfig.expiringSoonDays,
+} = {}) {
+  const file = cacheFile ?? join(stateDir, "codebuddy-usage.json");
+  const cache = readCache(file);
+  if (!cache?.remote) {
+    return { credit: 0, count: 0, nextExpiryDays: null, fetchedAt: null };
+  }
+  const annotated = annotateAccountSummary(cache.remote, { now, expiringSoonDays });
+  return {
+    credit: annotated?.expiringSoon?.credit ?? 0,
+    count: annotated?.expiringSoon?.count ?? 0,
+    nextExpiryDays: annotated?.expiringSoon?.nextExpiryDays ?? null,
+    fetchedAt: cache.fetchedAt ? new Date(cache.fetchedAt).toISOString() : null,
+  };
+}
+
 // Local consumption from both ~/.codebuddy/projects/<cwd>/<sid>.jsonl (interactive CLI, hub workers,
 // and persistent swarm sessions) and <stateDir>/cb-runs/cb_*.json (ephemeral swarm runs and any
 // persisted swarm runs whose JSONL is no longer present). Persistent swarm runs already counted
@@ -299,6 +358,7 @@ function extractStateUsageTokens(u) {
 export function localUsage({
   projectsDir = cbConfig.projectsDir,
   runsDir = cbConfig.runsDir,
+  batchesDir = runsDir ? join(dirname(runsDir), "batches") : null,
   sinceMs = 0,
   topLimit = 10,
 } = {}) {
@@ -306,10 +366,13 @@ export function localUsage({
     credit: 0,
     requests: 0,
     tasks: 0,
+    creditPer1MTokens: 0,
+    latencyMs: null,
     tokens: { ...makeTokenBucket(), cacheHitRatePct: 0 },
     byDay: {},
     daily: [],
     byTask: {},
+    byBatch: {},
     byModel: {},
     byProfile: {},
     bySource: {
@@ -329,10 +392,11 @@ export function localUsage({
     topSwarmTasks: [],
   };
 
-  // Step 1: Index swarm runner state files (<stateDir>/cb-runs/cb_*.json).
+  // Step 1: Index swarm runner state files (<stateDir>/cb-runs/cb_*.json) and batch attribution.
   const cbRuns = [];
   const cbBySessionFile = new Map();
   const cbBySessionId = new Map();
+  const batchByTaskId = buildCbBatchIndex(batchesDir);
   if (runsDir && existsSync(runsDir)) {
     for (const f of readdirSync(runsDir)) {
       if (!CB_RUN_FILE_RE.test(f)) continue;
@@ -346,9 +410,11 @@ export function localUsage({
   }
 
   const allSessionKeys = new Set();
+  const allDurations = [];
   const dayBuckets = new Map();
   const modelBuckets = new Map();
   const profileBuckets = new Map();
+  const batchBuckets = new Map();
   const sourceSessions = {
     cli: new Set(),
     hub: new Set(),
@@ -366,6 +432,8 @@ export function localUsage({
     out.byDay[day] = (out.byDay[day] ?? 0) + credit;
 
     if (sessionKey) allSessionKeys.add(sessionKey);
+    const validDur = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : null;
+    if (validDur !== null) allDurations.push(validDur);
 
     let db = dayBuckets.get(day);
     if (!db) {
@@ -380,7 +448,7 @@ export function localUsage({
     const modelKey = model || "unknown";
     let mb = modelBuckets.get(modelKey);
     if (!mb) {
-      mb = { credit: 0, requests: 0, sessions: new Set(), tokens: makeTokenBucket(), peakContext: 0 };
+      mb = { credit: 0, requests: 0, sessions: new Set(), tokens: makeTokenBucket(), peakContext: 0, durations: [] };
       modelBuckets.set(modelKey, mb);
     }
     mb.credit += credit;
@@ -388,6 +456,7 @@ export function localUsage({
     if (sessionKey) mb.sessions.add(sessionKey);
     addTokens(mb.tokens, tok);
     mb.peakContext = Math.max(mb.peakContext, tok.peakContext ?? 0);
+    if (validDur !== null) mb.durations.push(validDur);
 
     const profKey = profile || source;
     let pb = profileBuckets.get(profKey);
@@ -419,12 +488,26 @@ export function localUsage({
     }
 
     if (swarmRun) {
+      const batchId = batchByTaskId.get(swarmRun.taskId);
+      if (batchId) {
+        let bb = batchBuckets.get(batchId);
+        if (!bb) {
+          bb = { credit: 0, requests: 0, sessions: new Set(), totalTokens: 0 };
+          batchBuckets.set(batchId, bb);
+        }
+        bb.credit += credit;
+        bb.requests += requests;
+        bb.sessions.add(swarmRun.taskId);
+        bb.totalTokens += tok.totalTokens;
+      }
+
       let st = swarmTaskStats.get(swarmRun.taskId);
       if (!st) {
         const fallbackDur =
           swarmRun.endedAt && swarmRun.startedAt ? Math.max(0, swarmRun.endedAt - swarmRun.startedAt) : null;
         st = {
           taskId: swarmRun.taskId,
+          ...(batchId ? { batchId } : {}),
           model: modelKey,
           profile: swarmRun.profile ?? "lite",
           ephemeral: Boolean(swarmRun.ephemeral),
@@ -578,10 +661,24 @@ export function localUsage({
   // Finalize & round all aggregates cleanly.
   out.credit = r2(out.credit);
   out.tasks = allSessionKeys.size;
+  out.creditPer1MTokens = out.tokens.totalTokens > 0 ? r2((out.credit * 1_000_000) / out.tokens.totalTokens) : 0;
+  out.latencyMs = summarizeLatencies(allDurations);
   out.tokens.cacheHitRatePct = cacheHitPct(out.tokens.inputTokens, out.tokens.cacheReadInputTokens);
 
   for (const k of Object.keys(out.byDay)) out.byDay[k] = r2(out.byDay[k]);
   for (const t of Object.values(out.byTask)) t.credit = r2(t.credit);
+
+  const sortedBatches = [...batchBuckets.entries()].sort((a, b) => b[1].credit - a[1].credit || b[1].requests - a[1].requests);
+  for (const [bid, bb] of sortedBatches) {
+    const tasks = bb.sessions.size;
+    out.byBatch[bid] = {
+      credit: r2(bb.credit),
+      tasks,
+      requests: bb.requests,
+      avgCreditPerTask: tasks > 0 ? r4(bb.credit / tasks) : 0,
+      totalTokens: bb.totalTokens,
+    };
+  }
 
   out.daily = [...dayBuckets.values()]
     .sort((a, b) => a.date.localeCompare(b.date))
@@ -606,6 +703,8 @@ export function localUsage({
       tasks,
       avgCreditPerTask: tasks > 0 ? r4(mb.credit / tasks) : 0,
       avgCreditPerRequest: mb.requests > 0 ? r4(mb.credit / mb.requests) : 0,
+      creditPer1MTokens: mb.tokens.totalTokens > 0 ? r2((mb.credit * 1_000_000) / mb.tokens.totalTokens) : 0,
+      latencyMs: summarizeLatencies(mb.durations),
       inputTokens: mb.tokens.inputTokens,
       uncachedInputTokens: mb.tokens.uncachedInputTokens,
       outputTokens: mb.tokens.outputTokens,
@@ -643,6 +742,7 @@ export function localUsage({
     .slice(0, Math.max(0, topLimit))
     .map((st) => ({
       taskId: st.taskId,
+      ...(st.batchId ? { batchId: st.batchId } : {}),
       model: st.model,
       profile: st.profile,
       ephemeral: st.ephemeral,

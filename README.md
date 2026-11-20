@@ -16,9 +16,9 @@ agent ──MCP/stdio──> subagent-swarm-mcp (`swarm_*` / `zcode_*` / `bin/sw
                        └──> ZCode (`sess_*`, CDP 127.0.0.1:9222) ──> 官方 ZCode 桌面窗口 + 只读 SQLite/JSONL
 ```
 
-* **CodeBuddy & Qoder CLI 后端（`codebuddy`、`qoder`）：** 通过独立进程组 worker（`cb_<hex>` / `qd_<uuid>`）与 stdin 管道安全调用对应官方 CLI，原生提供 3 级权限/工具隔离模式（`lite` 零工具超低开销、`readonly` 只读检视且 CodeBuddy 内含 `ViewImage` 多模态看图、`workspace` 全量工作区权限）、支持 `waitSec` 单次内联拿结果、`-r` 多轮续聊、`-pgid` 整棵进程树终止、孤儿进程 fail-close 回收与实时 JSONL 工具状态观测。
+* **CodeBuddy & Qoder CLI 后端（`codebuddy`、`qoder`）：** 通过独立进程组 worker（`cb_<hex>` / `qd_<uuid>`）与 stdin 管道安全调用对应官方 CLI，原生提供 3 级权限/工具隔离模式（`lite` 零工具 + 精简 `--system-prompt`，实测单次基线输入 Token 下降约 57%；`readonly` 只读检视且 CodeBuddy 内含 `ViewImage` 多模态看图与 `--add-dir` 扩展目录；`workspace` 全量工作区权限）、支持 `effort`（`minimal`～`max` 控思考 Token）、`maxTurns`（防死循环保底）、空响应零 Token 自动 fail-close（`empty_response`）、`waitSec` 单次内联拿结果、`-r` 多轮续聊、`-pgid` 整棵进程树终止、孤儿进程回收与实时 JSONL 工具观测。
 * **ZCode 桌面端后端（`zcode`）：** 仅通过 Electron 本地回环 DevTools 端口（`127.0.0.1:9222`）与跨进程 `mkdir` 文件锁配合官方 ZCode 桌面窗口操作（不修改官方客户端文件，不提取或重放账号凭据，也不直接调用外部 ZCode CLI），严格校验计费路由白名单（`ZCODE_MCP_PROVIDERS`），只读读取本地 SQLite 与 JSONL 日志。原有 29 个 `zcode_*`、`hub_*` 与 `codebuddy_usage` 工具保持兼容。
-* **智能 `auto` 路由：** 按调用约束（`lite` / `readonly` / `ephemeral` / 自定义 `cwd` / 专属模型 / 专属计费路由）、后端健康度与当前空闲并发槽位自动在可用 CLI 与 ZCode 间分流。
+* **智能 `auto` 路由：** 按调用约束（`lite` / `readonly` / `ephemeral` / `effort` / `maxTurns` / `addDirs` / 自定义 `cwd` / 专属模型 / 专属计费路由）、后端健康度与空闲并发槽位自动分流；当本地缓存检测到 CodeBuddy 存在临期额度包且仍有空闲槽位时，自动优先消费临期额度（`CODEBUDDY_PREFER_WHEN_EXPIRING=0` 可关闭）。
 
 ## 快速上手
 

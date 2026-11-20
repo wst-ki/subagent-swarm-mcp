@@ -378,6 +378,11 @@ export async function runStructured({
   profile,
   cwd,
   ephemeral = false,
+  effort,
+  maxTurns,
+  systemPrompt,
+  appendSystemPrompt,
+  addDirs,
   waitSec = 0,
   fallbackModel,
   onProgress,
@@ -387,7 +392,18 @@ export async function runStructured({
   const prompt = structuredPrompt({ task, input, schema, domainRule });
   const ruleMeta = typeof domainRule === 'string' ? { domainRule } : {};
   const isLegacyZcodeCall =
-    backend === 'zcode' && !profile && !cwd && !ephemeral && !waitSec && !fallbackModel && !backends;
+    backend === 'zcode' &&
+    !profile &&
+    !cwd &&
+    !ephemeral &&
+    !effort &&
+    maxTurns === undefined &&
+    systemPrompt === undefined &&
+    !appendSystemPrompt &&
+    !addDirs &&
+    !waitSec &&
+    !fallbackModel &&
+    !backends;
   const started = isLegacyZcodeCall
     ? await runTask({ prompt, model, provider })
     : await swarmRun({
@@ -399,6 +415,11 @@ export async function runStructured({
         cwd,
         provider,
         ephemeral,
+        effort,
+        maxTurns,
+        systemPrompt,
+        appendSystemPrompt,
+        addDirs,
         waitSec,
         contract: { schema, domainRule: domainRule ?? null, input },
         onProgress,

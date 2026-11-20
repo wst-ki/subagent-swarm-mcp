@@ -39,6 +39,9 @@ const TASK_FILE_RE = /^cb_[\w-]+\.json$/;
 export const id = "codebuddy";
 export const CODEBUDDY_PROFILES = ["lite", "readonly", "workspace"];
 export const profiles = CODEBUDDY_PROFILES;
+export const CODEBUDDY_EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+export const DEFAULT_LITE_SYSTEM_PROMPT =
+  "You are a concise, accurate text-only assistant with no tools. Follow instructions and requested output formats strictly.";
 export const READONLY_TOOLS = "Read,ViewImage,Glob,Grep,WebSearch,WebFetch";
 export const DEFAULT_CODEBUDDY_MODELS = [
   "hy4flash-free",
@@ -97,6 +100,14 @@ export function cbBackendConfig(env = process.env) {
   const allowedModels = modelsRaw
     ? modelsRaw.split(",").map((s) => s.trim()).filter(Boolean)
     : DEFAULT_CODEBUDDY_MODELS;
+  const liteSpEnv = env.CODEBUDDY_LITE_SYSTEM_PROMPT?.trim();
+  const liteSystemPrompt =
+    liteSpEnv === "off" || liteSpEnv === "false"
+      ? null
+      : liteSpEnv || DEFAULT_LITE_SYSTEM_PROMPT;
+  const defaultEffortRaw = env.CODEBUDDY_DEFAULT_EFFORT?.trim() || null;
+  const defaultEffort =
+    defaultEffortRaw && CODEBUDDY_EFFORT_LEVELS.includes(defaultEffortRaw) ? defaultEffortRaw : null;
   return {
     bin: resolveCodebuddyBin(env),
     stateDir,
@@ -106,6 +117,8 @@ export function cbBackendConfig(env = process.env) {
     allowedModels,
     defaultCwd: env.CODEBUDDY_DEFAULT_CWD?.trim() || config.projectDir,
     maxRunning: Number(env.CODEBUDDY_MAX_RUNNING ?? 4),
+    liteSystemPrompt,
+    defaultEffort,
     stalledAfterSec: Number(env.ZCODE_MCP_STALLED_SEC ?? config.stalledAfterSec),
     startingTimeoutSec: Number(env.ZCODE_MCP_STARTING_TIMEOUT_SEC ?? config.startingTimeoutSec),
   };
@@ -153,9 +166,21 @@ export function buildCliArgs({
   fallbackModel = null,
   ephemeral = false,
   resume = false,
+  effort = null,
+  maxTurns = null,
+  systemPrompt = undefined,
+  appendSystemPrompt = null,
+  addDirs = null,
+  defaultLiteSystemPrompt = DEFAULT_LITE_SYSTEM_PROMPT,
 } = {}) {
   if (!CODEBUDDY_PROFILES.includes(profile)) {
     throw new Error(`Unsupported profile "${profile}"; expected one of: ${CODEBUDDY_PROFILES.join(", ")}`);
+  }
+  if (effort !== null && effort !== undefined && !CODEBUDDY_EFFORT_LEVELS.includes(effort)) {
+    throw new Error(`Unsupported effort "${effort}"; expected one of: ${CODEBUDDY_EFFORT_LEVELS.join(", ")}`);
+  }
+  if (maxTurns !== null && maxTurns !== undefined && (!Number.isSafeInteger(maxTurns) || maxTurns < 1 || maxTurns > 100)) {
+    throw new Error("maxTurns must be an integer between 1 and 100");
   }
   const args = ["-p", "--output-format", "json"];
   if (resume) {
@@ -170,6 +195,17 @@ export function buildCliArgs({
 
   if (profile === "lite") {
     args.push("--tools", "", "--mcp-config", JSON.stringify({ mcpServers: {} }), "--strict-mcp-config");
+    if (!resume) {
+      const effectiveSp =
+        systemPrompt === false
+          ? null
+          : typeof systemPrompt === "string"
+            ? systemPrompt
+            : defaultLiteSystemPrompt;
+      if (effectiveSp && effectiveSp.trim()) {
+        args.push("--system-prompt", effectiveSp.trim());
+      }
+    }
   } else if (profile === "readonly") {
     args.push(
       "--tools",
@@ -181,8 +217,24 @@ export function buildCliArgs({
       "--strict-mcp-config",
       "-y",
     );
+    if (!resume && typeof systemPrompt === "string" && systemPrompt.trim()) {
+      args.push("--system-prompt", systemPrompt.trim());
+    }
   } else if (profile === "workspace") {
     args.push("-y");
+    if (!resume && typeof systemPrompt === "string" && systemPrompt.trim()) {
+      args.push("--system-prompt", systemPrompt.trim());
+    }
+  }
+
+  if (!resume && typeof appendSystemPrompt === "string" && appendSystemPrompt.trim()) {
+    args.push("--append-system-prompt", appendSystemPrompt.trim());
+  }
+  if (effort) args.push("--effort", effort);
+  if (maxTurns !== null && maxTurns !== undefined) args.push("--max-turns", String(maxTurns));
+  if (Array.isArray(addDirs) && addDirs.length > 0 && profile !== "lite") {
+    const cleaned = addDirs.map((d) => String(d ?? "").trim()).filter(Boolean);
+    if (cleaned.length > 0) args.push("--add-dir", ...cleaned);
   }
 
   if (model) args.push("--model", model);
@@ -296,7 +348,17 @@ export function parseCodebuddyJsonOutput(stdout) {
         ? lastAssistantText
         : null;
 
-  if (hasExplicitFailure && errors.length === 0) {
+  const isSilentEmptySuccess =
+    !hasExplicitFailure &&
+    (Boolean(resultEvent) || resultText !== null) &&
+    (!resultText || !resultText.trim()) &&
+    inputTokens === 0 &&
+    outputTokens === 0 &&
+    toolCalls === 0;
+
+  if (isSilentEmptySuccess && errors.length === 0) {
+    errors.push("CodeBuddy returned an empty zero-token response");
+  } else if (hasExplicitFailure && errors.length === 0) {
     errors.push(
       typeof resultEvent?.result === "string" && resultEvent.result.trim()
         ? resultEvent.result.trim()
@@ -305,8 +367,8 @@ export function parseCodebuddyJsonOutput(stdout) {
   }
 
   return {
-    ok: !hasExplicitFailure && (Boolean(resultEvent) || resultText !== null),
-    isError: hasExplicitFailure,
+    ok: !hasExplicitFailure && !isSilentEmptySuccess && (Boolean(resultEvent) || resultText !== null),
+    isError: hasExplicitFailure || isSilentEmptySuccess,
     subtype,
     result: resultText,
     errors,
@@ -380,6 +442,11 @@ export async function run({
   profile = "lite",
   cwd,
   ephemeral = false,
+  effort = null,
+  maxTurns = null,
+  systemPrompt = undefined,
+  appendSystemPrompt = null,
+  addDirs = null,
   contract = null,
   env = process.env,
   spawnImpl = spawn,
@@ -396,12 +463,22 @@ export async function run({
   if (!existsSync(resolvedCwd) || !statSync(resolvedCwd).isDirectory()) {
     throw new Error(`Invalid cwd: "${resolvedCwd}" does not exist or is not a directory.`);
   }
+  const resolvedAddDirs = Array.isArray(addDirs)
+    ? addDirs.map((d) => {
+        const rd = resolve(String(d ?? ""));
+        if (!existsSync(rd) || !statSync(rd).isDirectory()) {
+          throw new Error(`Invalid addDir: "${rd}" does not exist or is not a directory.`);
+        }
+        return rd;
+      })
+    : [];
 
   const active = runningCount({ env, isPidAlive });
   if (active >= cfg.maxRunning) {
     throw new Error(`CodeBuddy capacity limit reached (${active}/${cfg.maxRunning} tasks running). Wait or cancel one first.`);
   }
 
+  const effectiveEffort = effort ?? cfg.defaultEffort ?? null;
   const taskId = `cb_${randomBytes(12).toString("hex")}`;
   const cliArgs = buildCliArgs({
     taskId,
@@ -410,6 +487,12 @@ export async function run({
     fallbackModel,
     ephemeral: Boolean(ephemeral),
     resume: false,
+    effort: effectiveEffort,
+    maxTurns,
+    systemPrompt,
+    appendSystemPrompt,
+    addDirs: resolvedAddDirs,
+    defaultLiteSystemPrompt: cfg.liteSystemPrompt,
   });
 
   const stateFile = join(cfg.runsDir, `${taskId}.json`);
@@ -429,6 +512,9 @@ export async function run({
     fallbackModel: fallbackModel ?? null,
     actualModel: null,
     ephemeral: Boolean(ephemeral),
+    effort: effectiveEffort,
+    maxTurns: maxTurns ?? null,
+    ...(resolvedAddDirs.length > 0 ? { addDirs: resolvedAddDirs } : {}),
     sessionFile,
     sessionId: ephemeral ? null : taskId,
     jsonlStartOffset: 0,
@@ -471,6 +557,8 @@ export async function run({
     profile,
     cwd: resolvedCwd,
     ephemeral: Boolean(ephemeral),
+    ...(effectiveEffort ? { effort: effectiveEffort } : {}),
+    ...(maxTurns !== null && maxTurns !== undefined ? { maxTurns } : {}),
     mode: profile,
   };
 }
@@ -480,6 +568,8 @@ export async function followUp({
   prompt,
   model = null,
   fallbackModel = null,
+  effort = null,
+  maxTurns = null,
   env = process.env,
   spawnImpl = spawn,
   isPidAlive = defaultIsPidAlive,
@@ -509,6 +599,8 @@ export async function followUp({
 
   const finalPrompt = preparePrompt(prompt, { profile: prev.profile ?? "lite" });
   const chosenModel = model ?? prev.model ?? cfg.defaultModel;
+  const effectiveEffort = effort ?? prev.effort ?? cfg.defaultEffort ?? null;
+  const effectiveMaxTurns = maxTurns ?? prev.maxTurns ?? null;
   const cliArgs = buildCliArgs({
     taskId: prev.sessionId ?? taskId,
     profile: prev.profile ?? "lite",
@@ -516,6 +608,9 @@ export async function followUp({
     fallbackModel: fallbackModel ?? prev.fallbackModel ?? null,
     ephemeral: false,
     resume: true,
+    effort: effectiveEffort,
+    maxTurns: effectiveMaxTurns,
+    addDirs: prev.addDirs ?? null,
   });
 
   const jsonlStartOffset = prev.sessionFile && existsSync(prev.sessionFile) ? statSync(prev.sessionFile).size : 0;
@@ -610,6 +705,8 @@ export async function health({ env = process.env, isPidAlive = defaultIsPidAlive
     defaultModel: cfg.defaultModel,
     models: cfg.allowedModels,
     profiles: CODEBUDDY_PROFILES,
+    effortLevels: CODEBUDDY_EFFORT_LEVELS,
+    liteSystemPromptEnabled: Boolean(cfg.liteSystemPrompt),
     defaultCwd: cfg.defaultCwd,
     maxRunning: cfg.maxRunning,
     runningTasks: runningCount({ env, isPidAlive }),

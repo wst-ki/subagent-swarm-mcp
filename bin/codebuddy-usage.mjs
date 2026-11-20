@@ -141,9 +141,20 @@ async function main(argv) {
     lines.push("by model:");
     for (const [m, s] of models) {
       const remEst = r.runway?.estimatedTasksRemainingByModel?.[m]?.estimatedTasksRemaining;
+      const lat = s.latencyMs ? `, p50=${(s.latencyMs.p50 / 1000).toFixed(1)}s/p95=${(s.latencyMs.p95 / 1000).toFixed(1)}s` : "";
       lines.push(
-        `  ${m}: ${fmt(s.credit)} credits, ${s.tasks} tasks (${fmt(s.avgCreditPerTask, 4)}/task), ${s.requests} reqs, ${fmt(s.totalTokens, 0)} tok (${s.cacheHitRatePct}% cache hit)` +
+        `  ${m}: ${fmt(s.credit)} credits, ${s.tasks} tasks (${fmt(s.avgCreditPerTask, 4)}/task, ${fmt(s.creditPer1MTokens)}/1M tok), ${s.requests} reqs, ${fmt(s.totalTokens, 0)} tok (${s.cacheHitRatePct}% cache hit)${lat}` +
           (remEst != null ? `, ~${fmt(remEst, 0)} tasks left` : ""),
+      );
+    }
+  }
+
+  const batches = Object.entries(l.byBatch ?? {});
+  if (batches.length && topN > 0) {
+    lines.push(`by batch (showing ${Math.min(topN, batches.length)} of ${batches.length}):`);
+    for (const [bid, b] of batches.slice(0, topN)) {
+      lines.push(
+        `  ${bid}: ${fmt(b.credit)} credits, ${b.tasks} tasks (${fmt(b.avgCreditPerTask, 4)}/task), ${fmt(b.totalTokens, 0)} tok`,
       );
     }
   }

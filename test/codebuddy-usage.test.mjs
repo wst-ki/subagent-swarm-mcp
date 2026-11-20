@@ -12,7 +12,7 @@ process.env.CODEBUDDY_PROJECTS_DIR = join(root, "projects");
 delete process.env.CODEBUDDY_USAGE_TOKEN;
 delete process.env.CODEBUDDY_TOKEN_FILE;
 process.env.CODEBUDDY_AUTH_FILE = join(root, "cli-auth.info"); // never the real CLI login
-const { cbConfig, codebuddyUsage, fetchRemote, localUsage, readToken, saveToken, summarizeAccounts } = await import("../src/codebuddy-usage.mjs");
+const { cbConfig, codebuddyUsage, fetchRemote, localUsage, readCachedExpiringCredit, readToken, saveToken, summarizeAccounts } = await import("../src/codebuddy-usage.mjs");
 
 const jwt = (exp) => `h.${Buffer.from(JSON.stringify({ exp })).toString("base64url")}.sig`;
 
@@ -313,7 +313,76 @@ test("codebuddyUsage: computes runway burn rate, model task capacity, and expiri
     assert.equal(res.runway.estimatedTasksRemainingByModel["deepseek-v4.1-flash"].estimatedTasksRemaining, 50);
     assert.equal(res.runway.expiringRisk.expiringCredit, 19.5);
     assert.equal(res.runway.expiringRisk.likelyUnusedCredit, 13.5);
+
+    // readCachedExpiringCredit reads the cached file with zero network calls
+    const cachedExp = readCachedExpiringCredit({ stateDir: join(root, "state"), now, expiringSoonDays: 4 });
+    assert.equal(cachedExp.credit, 19.5);
+    assert.equal(cachedExp.count, 1);
+    assert.equal(cachedExp.nextExpiryDays, 3);
   } finally {
     delete process.env.CODEBUDDY_USAGE_TOKEN;
   }
+});
+
+test("localUsage: computes latency percentiles, creditPer1MTokens, and byBatch attribution", () => {
+  const bState = join(root, "batch-attr-state");
+  const runsDir = join(bState, "cb-runs");
+  const batchDir = join(bState, "batches", "wave-alpha");
+  mkdirSync(runsDir, { recursive: true });
+  mkdirSync(batchDir, { recursive: true });
+
+  const t0 = new Date(2026, 10, 20, 9, 0, 0).getTime();
+  writeFileSync(
+    join(runsDir, "cb_b1.json"),
+    JSON.stringify({
+      taskId: "cb_b1",
+      status: "completed",
+      profile: "lite",
+      model: "deepseek-v4.1-flash",
+      ephemeral: true,
+      startedAt: t0,
+      endedAt: t0 + 10_000,
+      turns: [{ index: 1, startedAt: t0, endedAt: t0 + 10_000, durationMs: 10_000, usage: { inputTokens: 8000, outputTokens: 2000, cacheReadInputTokens: 4000, modelRequests: 1, credit: 0.2 } }],
+      usage: { inputTokens: 8000, outputTokens: 2000, cacheReadInputTokens: 4000, modelRequests: 1, credit: 0.2 },
+    }),
+  );
+  writeFileSync(
+    join(runsDir, "cb_b2.json"),
+    JSON.stringify({
+      taskId: "cb_b2",
+      status: "completed",
+      profile: "lite",
+      model: "deepseek-v4.1-flash",
+      ephemeral: true,
+      startedAt: t0 + 15_000,
+      endedAt: t0 + 45_000,
+      turns: [{ index: 1, startedAt: t0 + 15_000, endedAt: t0 + 45_000, durationMs: 30_000, usage: { inputTokens: 8000, outputTokens: 2000, cacheReadInputTokens: 4000, modelRequests: 1, credit: 0.3 } }],
+      usage: { inputTokens: 8000, outputTokens: 2000, cacheReadInputTokens: 4000, modelRequests: 1, credit: 0.3 },
+    }),
+  );
+  writeFileSync(
+    join(batchDir, "results.jsonl"),
+    [
+      JSON.stringify({ itemId: "i1", itemKey: "k1", taskId: "cb_b1", structuredStatus: "valid" }),
+      JSON.stringify({ itemId: "i2", itemKey: "k2", taskId: "cb_b2", structuredStatus: "valid" }),
+    ].join("\n") + "\n",
+  );
+
+  const u = localUsage({ projectsDir: join(root, "none-proj"), runsDir, sinceMs: t0 - 1000 });
+  assert.equal(u.credit, 0.5);
+  assert.equal(u.creditPer1MTokens, 25); // 0.5 / 20_000 * 1_000_000
+  assert.equal(u.latencyMs.samples, 2);
+  assert.equal(u.latencyMs.avg, 20_000);
+  assert.equal(u.latencyMs.p50, 10_000);
+  assert.equal(u.latencyMs.max, 30_000);
+  assert.equal(u.byModel["deepseek-v4.1-flash"].creditPer1MTokens, 25);
+  assert.equal(u.byModel["deepseek-v4.1-flash"].latencyMs.avg, 20_000);
+  assert.deepEqual(u.byBatch["wave-alpha"], {
+    credit: 0.5,
+    tasks: 2,
+    requests: 2,
+    avgCreditPerTask: 0.25,
+    totalTokens: 20_000,
+  });
+  assert.equal(u.topSwarmTasks[0].batchId, "wave-alpha");
 });
