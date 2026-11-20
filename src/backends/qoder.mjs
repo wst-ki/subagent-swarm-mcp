@@ -618,7 +618,22 @@ export async function quota({ sinceDays = 7, env = process.env, now = Date.now()
   const cfg = qoderBackendConfig(env);
   const account = cfg.bin && existsSync(cfg.bin) ? await readSanitizedCliStatus(cfg.bin, env) : null;
   const sinceMs = now - sinceDays * 86_400_000;
-  const local = { sinceDays, credit: 0, requests: 0, runs: 0, byDay: {} };
+  const local = {
+    sinceDays,
+    credit: 0,
+    requests: 0,
+    runs: 0,
+    tokens: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      totalTokens: 0,
+      cacheHitRatePct: 0,
+    },
+    byDay: {},
+    byModel: {},
+    byProfile: {},
+  };
   if (existsSync(cfg.runsDir)) {
     for (const f of readdirSync(cfg.runsDir)) {
       if (!TASK_FILE_RE.test(f)) continue;
@@ -627,17 +642,45 @@ export async function quota({ sinceDays = 7, env = process.env, now = Date.now()
       if (!runState || ts < sinceMs) continue;
       const credit = Number(runState.usage?.credit ?? 0);
       const reqs = Number(runState.usage?.modelRequests ?? 0);
+      const inTok = Number(runState.usage?.inputTokens ?? 0);
+      const outTok = Number(runState.usage?.outputTokens ?? 0);
+      const cacheRead = Number(runState.usage?.cacheReadInputTokens ?? 0);
+      const totTok = Number(runState.usage?.totalTokens ?? inTok + outTok);
       local.runs++;
       local.requests += reqs;
       local.credit = roundCredit(local.credit + credit);
+      local.tokens.inputTokens += inTok;
+      local.tokens.outputTokens += outTok;
+      local.tokens.cacheReadInputTokens += cacheRead;
+      local.tokens.totalTokens += totTok;
       const d = new Date(ts);
       const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
       local.byDay[day] = roundCredit((local.byDay[day] ?? 0) + credit);
+
+      const m = runState.actualModel || runState.model || "unknown";
+      const bm = (local.byModel[m] ??= { credit: 0, runs: 0, requests: 0, totalTokens: 0, avgCreditPerRun: 0 });
+      bm.credit = roundCredit(bm.credit + credit);
+      bm.runs++;
+      bm.requests += reqs;
+      bm.totalTokens += totTok;
+
+      const p = runState.profile || "lite";
+      const bp = (local.byProfile[p] ??= { credit: 0, runs: 0, requests: 0, totalTokens: 0 });
+      bp.credit = roundCredit(bp.credit + credit);
+      bp.runs++;
+      bp.requests += reqs;
+      bp.totalTokens += totTok;
     }
+  }
+  const denom = Math.max(local.tokens.inputTokens, local.tokens.cacheReadInputTokens);
+  local.tokens.cacheHitRatePct =
+    denom > 0 ? Math.round(Math.min(100, (100 * local.tokens.cacheReadInputTokens) / denom) * 100) / 100 : 0;
+  for (const bm of Object.values(local.byModel)) {
+    bm.avgCreditPerRun = bm.runs > 0 ? roundCredit(bm.credit / bm.runs) : 0;
   }
   return {
     account,
     local,
-    note: "Qoder CLI exposes remaining Plan/Add-on credit counters interactively via `/usage`; `local` aggregates `total_credits` reported by qodercli runs recorded in stateDir.",
+    note: "Qoder CLI exposes remaining Plan/Add-on credit counters interactively via `/usage`; `local` aggregates `total_credits`, tokens, models, and profiles reported by qodercli runs recorded in stateDir.",
   };
 }

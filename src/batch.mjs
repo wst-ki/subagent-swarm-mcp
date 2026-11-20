@@ -94,9 +94,29 @@ export function packChunks(items, { microbatchSize = 1, maxBatchInputChars = 30_
 }
 
 export function isCapacityOrLockBusyError(message) {
-  return /already has \d+ running task|capacity limit reached|No healthy backend with available capacity|Timed out waiting for another ZCode UI operation/i.test(
+  return /already has \d+ running task|capacity limit reached|No healthy backend with available capacity|Timed out waiting for another ZCode UI operation|Reserved \d+ slot\(s\)/i.test(
     String(message ?? ''),
   );
+}
+
+export function classifyBlocker(code, message = '') {
+  switch (code) {
+    case 'quota_or_rate_limit':
+      return { retryable: true, recommendedAction: 'cooldown_quota' };
+    case 'capacity_exhausted':
+      return { retryable: true, recommendedAction: 'wait_capacity' };
+    case 'credit_budget_reached':
+      return { retryable: false, recommendedAction: 'increase_credit_budget' };
+    case 'provider_route_mismatch':
+      return { retryable: false, recommendedAction: 'check_billing_route' };
+    case 'submission_circuit_breaker':
+      if (/quota|rate.limit|429|额度|限流/i.test(String(message ?? ''))) {
+        return { retryable: true, recommendedAction: 'cooldown_quota' };
+      }
+      return { retryable: false, recommendedAction: 'needs_human_auth' };
+    default:
+      return { retryable: false, recommendedAction: 'inspect_error' };
+  }
 }
 
 function readJsonlSafe(filePath) {
@@ -129,6 +149,15 @@ export function readBatchStatus(batchId, { stateDir = config.stateDir, includeIt
   const blocked = existsSync(join(dir, 'blocked.json'))
     ? JSON.parse(readFileSync(join(dir, 'blocked.json'), 'utf8'))
     : null;
+  let progress = null;
+  const progressFile = join(dir, 'progress.json');
+  if (existsSync(progressFile)) {
+    try {
+      progress = JSON.parse(readFileSync(progressFile, 'utf8'));
+    } catch {
+      progress = null;
+    }
+  }
   const latestByKey = new Map();
   for (const r of results.records) {
     if (r && r.itemKey) latestByKey.set(r.itemKey, r);
@@ -207,7 +236,41 @@ export function readBatchStatus(batchId, { stateDir = config.stateDir, includeIt
     counts,
     usage,
     corruptLines: manifest.corruptLines + results.corruptLines,
+    ...(progress ? { progress } : {}),
     ...(includeItems !== false ? { items } : {}),
+  };
+}
+
+/**
+ * Crash-safe export of all currently `valid` items from `<stateDir>/batches/<batchId>/results.jsonl`,
+ * even if the batch was interrupted mid-wave before writing an export file.
+ */
+export function exportBatchValidItems(
+  batchId,
+  { stateDir = config.stateDir, unpackItem = null, rawByItemId = null } = {},
+) {
+  const report = readBatchStatus(batchId, { stateDir, includeItems: true });
+  const validItems = report.items.filter(it => it.status === 'valid');
+  const exported = validItems.map(it =>
+    typeof unpackItem === 'function'
+      ? unpackItem(rawByItemId?.get(it.itemId), it)
+      : {
+          itemId: it.itemId,
+          status: it.status,
+          value: it.value ?? null,
+          ...(it.taskId ? { taskId: it.taskId } : {}),
+          ...(it.model ? { model: it.model } : {}),
+        },
+  );
+  return {
+    batchId: report.batchId,
+    dir: report.dir,
+    status: report.status,
+    blocked: report.blocked,
+    counts: report.counts,
+    usage: report.usage,
+    exportedCount: exported.length,
+    items: exported,
   };
 }
 
@@ -232,6 +295,8 @@ export async function runStructuredBatch({
   model,
   provider,
   maxConcurrency = 1,
+  reserveSlots = 0,
+  maxCredit = null,
   maxRetries = 1,
   pollIntervalMs = undefined,
   maxPollIntervalMs = 5000,
@@ -244,6 +309,7 @@ export async function runStructuredBatch({
   runner = runStructured,
   evaluator = null,
   canceller = undefined,
+  healthFn = null,
   sleeper = sleep,
 }) {
   if (!Array.isArray(items) || items.length === 0 || items.length > 1000) {
@@ -255,6 +321,9 @@ export async function runStructuredBatch({
   }
   if (!Number.isSafeInteger(capacityWaitMs) || capacityWaitMs < 0 || capacityWaitMs > 3_600_000) {
     throw new Error('capacityWaitMs must be an integer between 0 and 3600000');
+  }
+  if (maxCredit !== null && maxCredit !== undefined && (!Number.isFinite(maxCredit) || maxCredit <= 0)) {
+    throw new Error('maxCredit must be a positive number');
   }
   const chosenAdapter = await selectBackend({
     backend,
@@ -275,6 +344,15 @@ export async function runStructuredBatch({
   if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > maxLimit) {
     throw new Error(`maxConcurrency must be an integer between 1 and ${maxLimit}`);
   }
+  if (!Number.isSafeInteger(reserveSlots) || reserveSlots < 0 || reserveSlots >= maxLimit) {
+    throw new Error(`reserveSlots must be an integer between 0 and ${Math.max(0, maxLimit - 1)}`);
+  }
+  const effectiveConcurrency = Math.min(maxConcurrency, Math.max(1, maxLimit - reserveSlots));
+  const probeHealth = reserveSlots > 0
+    ? (healthFn ?? (runner === runStructured && typeof chosenAdapter.health === 'function'
+        ? () => chosenAdapter.health({ env })
+        : null))
+    : null;
   if (!Number.isSafeInteger(maxRetries) || maxRetries < 0 || maxRetries > 1) {
     throw new Error('maxRetries must be 0 or 1');
   }
@@ -287,6 +365,7 @@ export async function runStructuredBatch({
   const manifestPath = join(dir, 'manifest.jsonl');
   const resultsPath = join(dir, 'results.jsonl');
   const blockedPath = join(dir, 'blocked.json');
+  const progressPath = join(dir, 'progress.json');
   const summaryPath = join(dir, 'summary.json');
 
   // Clear previous blocked.json if resuming explicitly
@@ -340,15 +419,85 @@ export async function runStructuredBatch({
   const cpuStart = process.cpuUsage();
   const wallStart = Date.now();
   let blockedReason = null;
+  let inFlight = 0;
+
+  // Track cumulative deduplicated credit/tokens across already-recorded and new runs.
+  const countedUsageTaskIds = new Set();
+  let cumulativeCredit = 0;
+  let cumulativeTokens = 0;
+  const trackTaskUsage = (taskId, usageObj) => {
+    if (!usageObj) return;
+    if (taskId) {
+      if (countedUsageTaskIds.has(taskId)) return;
+      countedUsageTaskIds.add(taskId);
+    }
+    cumulativeCredit = Math.round((cumulativeCredit + Number(usageObj.credit ?? 0)) * 10000) / 10000;
+    cumulativeTokens += Number(usageObj.totalTokens ?? 0);
+  };
+  for (const prevRec of latestByKey.values()) {
+    trackTaskUsage(prevRec?.taskId, prevRec?.usage);
+  }
+
+  const writeProgress = (state = 'running') => {
+    let valid = 0;
+    let invalid = 0;
+    let failed = 0;
+    let pending = 0;
+    for (const m of manifestByKey.values()) {
+      const rec = latestByKey.get(m.itemKey);
+      if (!rec || rec.structuredStatus === 'pending') pending++;
+      else if (rec.structuredStatus === 'valid') valid++;
+      else if (rec.structuredStatus === 'invalid') invalid++;
+      else failed++;
+    }
+    writeJsonFileAtomic(progressPath, {
+      batchId,
+      state,
+      backend: resolvedBackend,
+      totalItems: manifestByKey.size,
+      valid,
+      invalid,
+      failed,
+      pending,
+      inFlight,
+      credit: cumulativeCredit,
+      totalTokens: cumulativeTokens,
+      effectiveConcurrency,
+      reserveSlots,
+      ...(maxCredit != null ? { maxCredit } : {}),
+      startedAt: new Date(wallStart).toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  };
 
   const stopWithBlocker = (code, message, detail = {}) => {
+    const taxonomy = classifyBlocker(code, message);
     blockedReason = {
       code,
       message,
+      ...taxonomy,
       at: new Date().toISOString(),
       ...detail,
     };
     writeJsonFileAtomic(blockedPath, blockedReason);
+    writeProgress('blocked');
+  };
+
+  const checkCreditBudget = (itemId = null, taskId = null) => {
+    if (maxCredit != null && cumulativeCredit >= maxCredit && !blockedReason) {
+      stopWithBlocker(
+        'credit_budget_reached',
+        `Cumulative batch credit ${cumulativeCredit} reached maxCredit budget ${maxCredit}`,
+        {
+          ...(itemId ? { itemId } : {}),
+          ...(taskId ? { taskId } : {}),
+          cumulativeCredit,
+          maxCredit,
+        },
+      );
+      return true;
+    }
+    return Boolean(blockedReason);
   };
 
   function isEligibleItem(normItem) {
@@ -375,6 +524,35 @@ export async function runStructuredBatch({
         const aborted = new Error('Batch halted by active circuit breaker');
         aborted.abortedByBlocker = true;
         throw aborted;
+      }
+      if (probeHealth) {
+        let h = null;
+        try {
+          h = await probeHealth();
+        } catch {
+          h = null;
+        }
+        if (h && Number.isFinite(h.runningTasks)) {
+          const limit = Number.isFinite(h.maxRunning) ? h.maxRunning : maxLimit;
+          const allowed = Math.max(1, limit - reserveSlots);
+          if (h.runningTasks >= allowed) {
+            if (capacityWaitMs > 0 && Date.now() - waitStart < capacityWaitMs && !blockedReason) {
+              await sleeper(waitMs);
+              waitMs = Math.min(maxPollIntervalMs, Math.round(waitMs * 1.25));
+              continue;
+            }
+            if (blockedReason) {
+              const aborted = new Error('Batch halted by active circuit breaker');
+              aborted.abortedByBlocker = true;
+              throw aborted;
+            }
+            const capErr = new Error(
+              `Reserved ${reserveSlots} slot(s) for other work (${h.runningTasks}/${limit} currently running on ${resolvedBackend})`,
+            );
+            capErr.capacityExhausted = true;
+            throw capErr;
+          }
+        }
       }
       try {
         return await runner(payload);
@@ -540,6 +718,8 @@ export async function runStructuredBatch({
       };
       appendFileSync(resultsPath, JSON.stringify(rec) + '\n', 'utf8');
       latestByKey.set(normItem.itemKey, rec);
+      trackTaskUsage(started.taskId, evalRes.usage);
+      writeProgress('running');
 
       if (evalRes.failureKind === 'quota_or_rate_limit') {
         stopWithBlocker('quota_or_rate_limit', `Task ${started.taskId} hit quota or rate limit`, {
@@ -549,6 +729,8 @@ export async function runStructuredBatch({
         });
         return;
       }
+
+      if (checkCreditBudget(normItem.itemId, started.taskId)) return;
 
       if (evalRes.structuredStatus === 'valid') return;
       if (evalRes.structuredStatus === 'invalid' && attempt <= maxRetries) {
@@ -775,30 +957,53 @@ export async function runStructuredBatch({
         }
       }
 
+      trackTaskUsage(started.taskId, evalRes.usage);
+      writeProgress('running');
+      if (checkCreditBudget(remaining[0]?.itemId ?? null, started.taskId)) return;
+
       remaining = nextRemaining;
       if (remaining.length === 0 || attempt > maxRetries) break;
     }
   }
 
+  if (pendingItems.length > 0) {
+    checkCreditBudget(pendingItems[0]?.itemId ?? null, null);
+  }
+  if (!blockedReason) writeProgress('running');
+
   async function workerLoop() {
     while (!blockedReason) {
       const idx = cursor++;
       if (idx >= chunks.length) break;
-      await processMicrobatchChunk(chunks[idx]);
+      if (checkCreditBudget(chunks[idx]?.[0]?.itemId ?? null, null)) break;
+      inFlight++;
+      try {
+        await processMicrobatchChunk(chunks[idx]);
+      } finally {
+        inFlight = Math.max(0, inFlight - 1);
+      }
     }
   }
 
-  const workers = Array.from({ length: Math.min(maxConcurrency, Math.max(1, chunks.length)) }, () => workerLoop());
+  const workers = Array.from({ length: Math.min(effectiveConcurrency, Math.max(1, chunks.length)) }, () => workerLoop());
   await Promise.all(workers);
 
   const cpuDelta = process.cpuUsage(cpuStart);
   const wallMs = Date.now() - wallStart;
   const mem = process.memoryUsage();
+  const finalState = blockedReason ? 'blocked' : 'completed';
+  writeProgress(finalState);
   const statusReport = readBatchStatus(batchId, { stateDir, includeItems: true });
+  if (!blockedReason && statusReport.counts.pending > 0) {
+    writeProgress('incomplete');
+  }
   const summary = {
     ...statusReport,
     backend: resolvedBackend,
     microbatchSize,
+    effectiveConcurrency,
+    reserveSlots,
+    ...(maxCredit != null ? { maxCredit } : {}),
     metrics: {
       wallMs,
       cpuUserMs: Number((cpuDelta.user / 1000).toFixed(2)),

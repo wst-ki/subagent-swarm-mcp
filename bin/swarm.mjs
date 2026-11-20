@@ -15,7 +15,7 @@ import {
   swarmWait,
 } from "../src/backends/registry.mjs";
 import { TASK_SPECS, runStructured, structuredResult } from "../src/structured.mjs";
-import { readBatchStatus, runStructuredBatch } from "../src/batch.mjs";
+import { exportBatchValidItems, readBatchStatus, runStructuredBatch } from "../src/batch.mjs";
 
 const USAGE = `usage: swarm <command>
   backends                 inspect registered backends (codebuddy, qoder, zcode) and health
@@ -26,9 +26,10 @@ const USAGE = `usage: swarm <command>
   structured-result <taskId> [--domain-rule R]
   batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1]
       [--backend auto|codebuddy|qoder|zcode] [--profile P] [--cwd DIR] [--model M] [--provider KEY]
-      [--concurrency N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS] [--state-dir DIR]
-      [--ephemeral] [--export OUT_FILE] [--summary OUT_FILE] [--compact]
+      [--concurrency N] [--reserve-slots N] [--max-credit N] [--max-batch-chars N] [--timeout-ms MS]
+      [--capacity-wait-ms MS] [--state-dir DIR] [--ephemeral] [--export OUT_FILE] [--summary OUT_FILE] [--compact]
   batch-status <batchId> [--state-dir DIR] [--compact]
+  batch-export <batchId> [--out FILE] [--spec PRESET_OR_FILE] [--input JSONL_FILE] [--state-dir DIR] [--compact]
   wait <taskId> [timeoutSec]
   status <taskId>
   result <taskId>
@@ -56,12 +57,15 @@ const VALUE_FLAGS = new Set([
   "--microbatch",
   "--retries",
   "--concurrency",
+  "--reserve-slots",
+  "--max-credit",
   "--max-batch-chars",
   "--timeout-ms",
   "--capacity-wait-ms",
   "--state-dir",
   "--summary",
   "--export",
+  "--out",
   "--days",
 ]);
 
@@ -195,6 +199,8 @@ const commands = {
     const microbatchSize = numFlag("--microbatch") ?? 1;
     const maxRetries = numFlag("--retries") ?? 1;
     const maxConcurrency = numFlag("--concurrency") ?? 1;
+    const reserveSlots = numFlag("--reserve-slots") ?? 0;
+    const maxCredit = numFlag("--max-credit");
     const maxBatchInputChars = numFlag("--max-batch-chars");
     const itemTimeoutMs = numFlag("--timeout-ms");
     const capacityWaitMs = numFlag("--capacity-wait-ms");
@@ -221,6 +227,8 @@ const commands = {
       ...(maxBatchInputChars !== undefined ? { maxBatchInputChars } : {}),
       maxRetries,
       maxConcurrency,
+      reserveSlots,
+      ...(maxCredit !== undefined ? { maxCredit } : {}),
       ...(itemTimeoutMs !== undefined ? { itemTimeoutMs } : {}),
       ...(capacityWaitMs !== undefined ? { capacityWaitMs } : {}),
       ...(stateDir ? { stateDir } : {}),
@@ -251,6 +259,39 @@ const commands = {
     const stateDir = flag("--state-dir");
     const compact = bools.has("--compact");
     return readBatchStatus(pos(0, "batchId"), { ...(stateDir ? { stateDir } : {}), includeItems: !compact });
+  },
+  "batch-export": async () => {
+    const batchId = pos(0, "batchId");
+    const stateDir = flag("--state-dir");
+    const outPath = flag("--out") ?? flag("--export");
+    const specArg = flag("--spec");
+    const inputPath = flag("--input");
+    const compact = bools.has("--compact");
+
+    let unpackItem = null;
+    let rawByItemId = null;
+    if (specArg) {
+      const spec = await loadTaskSpec(specArg);
+      unpackItem = spec.unpackItem;
+      if (inputPath) {
+        const rawRows = (await readTextFileWithRetry(inputPath))
+          .split("\n")
+          .filter((l) => l.trim().length > 0)
+          .map((l) => JSON.parse(l));
+        rawByItemId = new Map(rawRows.map((row, idx) => [spec.packItem(row, idx).itemId, row]));
+      }
+    }
+
+    const exported = exportBatchValidItems(batchId, {
+      ...(stateDir ? { stateDir } : {}),
+      unpackItem,
+      rawByItemId,
+    });
+    if (outPath) {
+      writeJsonFileAtomic(outPath, exported.items);
+      exported.exportedTo = outPath;
+    }
+    return compact ? { ...exported, items: undefined } : exported;
   },
   wait: () =>
     swarmWait({

@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { readBatchStatus, runStructuredBatch } from "../src/batch.mjs";
+import { classifyBlocker, exportBatchValidItems, readBatchStatus, runStructuredBatch } from "../src/batch.mjs";
 import { readTextFileWithRetry } from "../src/cli-io.mjs";
 import { SECTION_OUTLINE_SCHEMA } from "../src/structured.mjs";
 
@@ -379,4 +379,194 @@ test("readTextFileWithRetry recovers from transient SMB lookup blips and fails f
     /denied/,
   );
   assert.equal(permCalls, 1);
+});
+
+test("batch enforces maxCredit circuit breaker with actionable blocker taxonomy and resumes cleanly", async () => {
+  const stateDir = makeTempDir("credit-cap-");
+  try {
+    let calls = 0;
+    const items = [
+      { itemId: "b1", input: { expected: [1] } },
+      { itemId: "b2", input: { expected: [1] } },
+      { itemId: "b3", input: { expected: [1] } },
+    ];
+    const evalOk = async (taskId) => ({
+      taskId,
+      status: "completed",
+      structuredStatus: "valid",
+      value: { labels: [{ i: 1, level: 1, role: "title", conf: 1 }] },
+      model: { providerId: "account:bigmodel-individual-coding-plan", modelId: "GLM-5.3-Flash" },
+      usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120, toolCalls: 0, modelRequests: 1, credit: 0.6 },
+    });
+
+    const stopped = await runStructuredBatch({
+      batchId: "credit-budget-1",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      items,
+      maxConcurrency: 1,
+      maxCredit: 1.0,
+      stateDir,
+      runner: async () => ({ taskId: `session_cb_${++calls}` }),
+      evaluator: evalOk,
+      sleeper: async () => {},
+    });
+    assert.equal(stopped.status, "blocked");
+    assert.equal(stopped.blocked.code, "credit_budget_reached");
+    assert.equal(stopped.blocked.retryable, false);
+    assert.equal(stopped.blocked.recommendedAction, "increase_credit_budget");
+    assert.equal(stopped.counts.valid, 2); // b1 (0.6) + b2 (1.2 >= 1.0) -> stops before b3
+    assert.equal(stopped.counts.pending, 1);
+    assert.equal(calls, 2);
+
+    // Partial crash-safe export salvages the 2 valid items even while blocked!
+    const partial = exportBatchValidItems("credit-budget-1", { stateDir });
+    assert.equal(partial.exportedCount, 2);
+    assert.deepEqual(partial.items.map((x) => x.itemId), ["b1", "b2"]);
+
+    // Verify progress.json heartbeat exists and reports blocked state
+    const st = readBatchStatus("credit-budget-1", { stateDir, includeItems: false });
+    assert.equal(st.progress.state, "blocked");
+    assert.equal(st.progress.valid, 2);
+    assert.equal(st.progress.credit, 1.2);
+
+    // Resume with raised budget -> only b3 runs!
+    const resumed = await runStructuredBatch({
+      batchId: "credit-budget-1",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      items,
+      maxConcurrency: 1,
+      maxCredit: 2.5,
+      stateDir,
+      runner: async () => ({ taskId: `session_cb_${++calls}` }),
+      evaluator: evalOk,
+      sleeper: async () => {},
+    });
+    assert.equal(resumed.status, "completed");
+    assert.equal(resumed.counts.valid, 3);
+    assert.equal(calls, 3);
+    assert.equal(resumed.progress.state, "completed");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("batch reserveSlots yields dynamically when other tasks occupy slots and classifyBlocker distinguishes actions", async () => {
+  assert.deepEqual(classifyBlocker("quota_or_rate_limit"), { retryable: true, recommendedAction: "cooldown_quota" });
+  assert.deepEqual(classifyBlocker("capacity_exhausted"), { retryable: true, recommendedAction: "wait_capacity" });
+  assert.deepEqual(classifyBlocker("provider_route_mismatch"), { retryable: false, recommendedAction: "check_billing_route" });
+  assert.deepEqual(classifyBlocker("submission_circuit_breaker", "login session expired"), {
+    retryable: false,
+    recommendedAction: "needs_human_auth",
+  });
+  assert.deepEqual(classifyBlocker("submission_circuit_breaker", "HTTP 429 rate limit"), {
+    retryable: true,
+    recommendedAction: "cooldown_quota",
+  });
+
+  const stateDir = makeTempDir("reserve-slots-");
+  try {
+    // Part A: Health shows 2/3 running while reserveSlots=1 (allowed=2) -> waits until 1/3, then runs!
+    let healthChecks = 0;
+    const res = await runStructuredBatch({
+      batchId: "reserve-wait-ok",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      items: [{ itemId: "r1", input: { expected: [1] } }],
+      maxConcurrency: 3,
+      reserveSlots: 1,
+      capacityWaitMs: 5_000,
+      pollIntervalMs: 5,
+      stateDir,
+      healthFn: async () => {
+        healthChecks++;
+        return { ok: true, runningTasks: healthChecks <= 2 ? 2 : 1, maxRunning: 3 };
+      },
+      runner: async () => ({ taskId: "session_res_ok" }),
+      evaluator: async (taskId) => ({
+        taskId,
+        status: "completed",
+        structuredStatus: "valid",
+        value: { labels: [{ i: 1, level: 1, role: "title", conf: 1 }] },
+        model: { providerId: "account:bigmodel-individual-coding-plan", modelId: "GLM-5.3-Flash" },
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, toolCalls: 0, modelRequests: 1 },
+      }),
+      sleeper: async () => {},
+    });
+    assert.equal(res.status, "completed");
+    assert.equal(res.effectiveConcurrency, 2);
+    assert.equal(res.reserveSlots, 1);
+    assert.equal(healthChecks, 3);
+
+    // Part B: With capacityWaitMs=0 and runningTasks >= limit - reserveSlots -> trips retryable capacity_exhausted
+    const blocked = await runStructuredBatch({
+      batchId: "reserve-exhaust",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      items: [{ itemId: "r2", input: { expected: [1] } }],
+      maxConcurrency: 2,
+      reserveSlots: 1,
+      capacityWaitMs: 0,
+      stateDir,
+      healthFn: async () => ({ ok: true, runningTasks: 2, maxRunning: 3 }),
+      runner: async () => {
+        throw new Error("should not have submitted while reserved slots are occupied");
+      },
+      evaluator: async () => ({ status: "pending", structuredStatus: "pending" }),
+      sleeper: async () => {},
+    });
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.blocked.code, "capacity_exhausted");
+    assert.equal(blocked.blocked.retryable, true);
+    assert.equal(blocked.blocked.recommendedAction, "wait_capacity");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("swarm batch-export CLI recovers valid items from results.jsonl into atomic JSON file", async () => {
+  const tmp = makeTempDir("batch-export-cli-");
+  try {
+    const stateDir = join(tmp, "state");
+    const batchDir = join(stateDir, "batches", "salvage-1");
+    mkdirSync(batchDir, { recursive: true });
+    writeFileSync(
+      join(batchDir, "manifest.jsonl"),
+      [
+        JSON.stringify({ itemId: "d1", itemKey: "k1" }),
+        JSON.stringify({ itemId: "d2", itemKey: "k2" }),
+      ].join("\n") + "\n",
+    );
+    writeFileSync(
+      join(batchDir, "results.jsonl"),
+      [
+        JSON.stringify({ itemId: "d1", itemKey: "k1", taskId: "cb_1", structuredStatus: "valid", value: { ok: true }, attempt: 1 }),
+        JSON.stringify({ itemId: "d2", itemKey: "k2", taskId: "cb_2", structuredStatus: "task_not_completed", failureKind: "timeout", attempt: 1 }),
+      ].join("\n") + "\n",
+    );
+
+    const outPath = join(tmp, "salvaged.json");
+    const res = await runSpawnCapture(process.execPath, [
+      resolve("bin/swarm.mjs"),
+      "batch-export",
+      "salvage-1",
+      "--state-dir",
+      stateDir,
+      "--out",
+      outPath,
+      "--compact",
+    ]);
+    assert.equal(res.code, 0, res.stderr);
+    const meta = JSON.parse(res.stdout);
+    assert.equal(meta.exportedCount, 1);
+    assert.equal(meta.exportedTo, outPath);
+    assert.equal("items" in meta, false);
+    const saved = JSON.parse(readFileSync(outPath, "utf8"));
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].itemId, "d1");
+    assert.deepEqual(saved[0].value, { ok: true });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });

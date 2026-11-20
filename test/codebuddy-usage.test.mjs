@@ -119,3 +119,201 @@ test("codebuddyUsage: caches the remote reading, keeps the last good one on fail
     delete process.env.CODEBUDDY_USAGE_TOKEN;
   }
 });
+
+test("summarizeAccounts: computes expiringSoon alerts, usedPct, and daysLeft relative to now", () => {
+  const now = Date.parse("2026-10-27T00:00:00");
+  const s = summarizeAccounts(ACCOUNTS, { now, expiringSoonDays: 4 });
+  assert.equal(s.used, 50);
+  assert.equal(s.activePackages, 2);
+  assert.equal(s.expiringSoon.count, 1);
+  assert.equal(s.expiringSoon.credit, 19.5);
+  assert.equal(s.expiringSoon.nextExpiry, "2026-10-30 00:00:00");
+  assert.equal(s.expiringSoon.nextExpiryDays, 3);
+  const oneOff = s.packages.find((p) => p.name === "one-off");
+  assert.equal(oneOff.expiringSoon, true);
+  assert.equal(oneOff.used, 30.5);
+  assert.equal(oneOff.usedPct, 61);
+  const monthly = s.packages.find((p) => p.name === "monthly");
+  assert.equal(monthly.expiringSoon, false);
+  assert.equal(monthly.daysLeft, 5);
+});
+
+test("localUsage: merges ephemeral cb-runs + JSONL without double-counting persistent swarm runs", () => {
+  const projDir = join(root, "merged-projects");
+  const runsDir = join(root, "merged-cb-runs");
+  mkdirSync(join(projDir, "proj-a"), { recursive: true });
+  mkdirSync(runsDir, { recursive: true });
+
+  const t0 = new Date(2026, 10, 19, 10, 0, 0).getTime();
+  const persistJsonl = join(projDir, "proj-a", "cb_persist01.jsonl");
+
+  // Persistent swarm run whose JSONL exists on disk (must be counted ONCE from JSONL, tagged as swarm/readonly)
+  writeFileSync(
+    persistJsonl,
+    [
+      JSON.stringify({
+        type: "message",
+        timestamp: t0,
+        sessionId: "cb_persist01",
+        providerData: {
+          messageId: "pm1",
+          model: "deepseek-v4.1-flash",
+          rawUsage: {
+            prompt_tokens: 10000,
+            prompt_cache_hit_tokens: 8000,
+            prompt_cache_miss_tokens: 2000,
+            completion_tokens: 500,
+            completion_thinking_tokens: 120,
+            total_tokens: 10500,
+            credit: 0.25,
+          },
+        },
+      }),
+    ].join("\n") + "\n",
+  );
+  writeFileSync(
+    join(runsDir, "cb_persist01.json"),
+    JSON.stringify({
+      taskId: "cb_persist01",
+      backend: "codebuddy",
+      status: "completed",
+      profile: "readonly",
+      model: "deepseek-v4.1-flash",
+      actualModel: "deepseek-v4.1-flash",
+      ephemeral: false,
+      sessionFile: persistJsonl,
+      sessionId: "cb_persist01",
+      startedAt: t0,
+      endedAt: t0 + 4000,
+      turns: [{ index: 1, startedAt: t0, endedAt: t0 + 4000, durationMs: 4000, usage: { inputTokens: 10000, outputTokens: 500, cacheReadInputTokens: 8000, totalTokens: 18500, modelRequests: 1, credit: 0.25 } }],
+      usage: { inputTokens: 10000, outputTokens: 500, cacheReadInputTokens: 8000, totalTokens: 18500, modelRequests: 1, credit: 0.25 },
+    }),
+  );
+
+  // Ephemeral swarm run (NO JSONL on disk — previously 100% invisible!)
+  writeFileSync(
+    join(runsDir, "cb_eph01.json"),
+    JSON.stringify({
+      taskId: "cb_eph01",
+      backend: "codebuddy",
+      status: "completed",
+      profile: "lite",
+      model: "deepseek-v4.1-flash",
+      actualModel: null,
+      ephemeral: true,
+      sessionFile: null,
+      sessionId: "01a1-uuid-eph",
+      startedAt: t0 + 10_000,
+      endedAt: t0 + 18_000,
+      turns: [{ index: 1, startedAt: t0 + 10_000, endedAt: t0 + 18_000, durationMs: 8000, usage: { inputTokens: 12000, outputTokens: 1000, cacheReadInputTokens: 6000, cacheWriteInputTokens: 0, totalTokens: 19000, modelRequests: 1, credit: 0.35 } }],
+      usage: { inputTokens: 12000, outputTokens: 1000, cacheReadInputTokens: 6000, cacheWriteInputTokens: 0, totalTokens: 19000, modelRequests: 1, credit: 0.35 },
+    }),
+  );
+
+  // Zero-token completed ephemeral run (edge case tracked in swarmRuns.zeroTokenCompleted)
+  writeFileSync(
+    join(runsDir, "cb_zero01.json"),
+    JSON.stringify({
+      taskId: "cb_zero01",
+      backend: "codebuddy",
+      status: "completed",
+      profile: "lite",
+      model: "hy4flash-free",
+      ephemeral: true,
+      sessionFile: null,
+      startedAt: t0 + 20_000,
+      endedAt: t0 + 20_200,
+      turns: [{ index: 1, startedAt: t0 + 20_000, endedAt: t0 + 20_200, durationMs: 200, usage: { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, totalTokens: 0, modelRequests: 1, credit: 0 } }],
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, totalTokens: 0, modelRequests: 1, credit: 0 },
+    }),
+  );
+
+  // Interactive CLI session
+  writeFileSync(
+    join(projDir, "proj-a", "interactive.jsonl"),
+    JSON.stringify({
+      type: "message",
+      timestamp: t0 + 30_000,
+      providerData: {
+        messageId: "im1",
+        model: "glm-5.3",
+        rawUsage: { prompt_tokens: 4000, prompt_cache_hit_tokens: 0, completion_tokens: 400, total_tokens: 4400, credit: 0.4 },
+      },
+    }) + "\n",
+  );
+
+  const u = localUsage({ projectsDir: projDir, runsDir, sinceMs: t0 - 1000 });
+  // 0.25 (persist once) + 0.35 (ephemeral) + 0.40 (cli) = 1.00 (no double counting!)
+  assert.equal(u.credit, 1);
+  assert.equal(u.requests, 4);
+  assert.equal(u.tasks, 4);
+  assert.equal(u.bySource.swarm.credit, 0.6);
+  assert.equal(u.bySource.swarm.ephemeralTasks, 2);
+  assert.equal(u.bySource.swarm.persistentTasks, 1);
+  assert.equal(u.bySource.cli.credit, 0.4);
+  assert.equal(u.swarmRuns.total, 3);
+  assert.equal(u.swarmRuns.ephemeral, 2);
+  assert.equal(u.swarmRuns.persistent, 1);
+  assert.equal(u.swarmRuns.zeroTokenCompleted, 1);
+
+  // Token math normalizes inclusive inputTokens without double-counting cacheRead
+  assert.equal(u.tokens.inputTokens, 26000);
+  assert.equal(u.tokens.cacheReadInputTokens, 14000);
+  assert.equal(u.tokens.uncachedInputTokens, 12000);
+  assert.equal(u.tokens.outputTokens, 1900);
+  assert.equal(u.tokens.reasoningTokens, 120);
+  assert.equal(u.tokens.totalTokens, 27900);
+  assert.equal(u.tokens.cacheHitRatePct, 53.85);
+
+  assert.equal(u.byModel["deepseek-v4.1-flash"].credit, 0.6);
+  assert.equal(u.byModel["deepseek-v4.1-flash"].tasks, 2);
+  assert.equal(u.byModel["deepseek-v4.1-flash"].avgCreditPerTask, 0.3);
+  assert.equal(u.byProfile.readonly.credit, 0.25);
+  assert.equal(u.byProfile.lite.credit, 0.35);
+  assert.equal(u.topSwarmTasks[0].taskId, "cb_eph01");
+  assert.equal(u.daily.length, 1);
+  assert.equal(u.daily[0].credit, 1);
+});
+
+test("codebuddyUsage: computes runway burn rate, model task capacity, and expiring risk", async () => {
+  process.env.CODEBUDDY_USAGE_TOKEN = "secret-runway-tok";
+  try {
+    const now = Date.parse("2026-10-27T00:00:00");
+    const runsDir = join(root, "runway-cb-runs");
+    mkdirSync(runsDir, { recursive: true });
+    writeFileSync(
+      join(runsDir, "cb_rw1.json"),
+      JSON.stringify({
+        taskId: "cb_rw1",
+        status: "completed",
+        profile: "lite",
+        model: "deepseek-v4.1-flash",
+        ephemeral: true,
+        startedAt: now - 86_400_000,
+        endedAt: now - 86_400_000 + 2000,
+        turns: [{ index: 1, startedAt: now - 86_400_000, endedAt: now - 86_400_000 + 2000, usage: { inputTokens: 5000, outputTokens: 500, cacheReadInputTokens: 2500, modelRequests: 1, credit: 2 } }],
+        usage: { inputTokens: 5000, outputTokens: 500, cacheReadInputTokens: 2500, modelRequests: 1, credit: 2 },
+      }),
+    );
+    const fakeFetch = async () =>
+      new Response(JSON.stringify({ data: { Response: { Data: { Accounts: ACCOUNTS } } } }), { status: 200 });
+    const res = await codebuddyUsage({
+      refresh: true,
+      sinceDays: 4,
+      expiringSoonDays: 4,
+      projectsDir: join(root, "empty-proj"),
+      runsDir,
+      fetchImpl: fakeFetch,
+      now,
+    });
+    assert.equal(res.remote.expiringSoon.credit, 19.5);
+    assert.equal(res.runway.avgDailyCredit, 0.5);
+    assert.equal(res.runway.activeDayAvgCredit, 2);
+    assert.equal(res.runway.estimatedDaysRemaining, 200);
+    assert.equal(res.runway.estimatedTasksRemainingByModel["deepseek-v4.1-flash"].estimatedTasksRemaining, 50);
+    assert.equal(res.runway.expiringRisk.expiringCredit, 19.5);
+    assert.equal(res.runway.expiringRisk.likelyUnusedCredit, 13.5);
+  } finally {
+    delete process.env.CODEBUDDY_USAGE_TOKEN;
+  }
+});

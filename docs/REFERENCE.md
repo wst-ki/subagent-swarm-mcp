@@ -21,8 +21,8 @@ Detailed specification for **subagent-swarm-mcp** (legacy bin `glm-zcode-mcp`) M
 | `swarm_quota {backend?, refresh?, sinceDays?}` | Read CodeBuddy billing/local usage, Qoder account/local usage, ZCode displayed quota, or all (`all`). |
 | `swarm_run_structured {task, input, schema, domainRule?, backend?, profile?, cwd?, ephemeral?, waitSec?, model?, fallbackModel?, provider?}` | Execute a bounded JSON Schema contract (`backend` defaults to `auto`; CLI defaults to `lite`); evaluates inline when `waitSec > 0` completes in time. |
 | `swarm_structured_result {taskId}` | Recover stored contract (from `<stateDir>/cb-runs/`, `<stateDir>/qd-runs/`, JSONL, or ZCode SQLite) and validate output. |
-| `swarm_batch_run {batchId, task, schema, items, backend?, profile?, cwd?, ephemeral?, microbatchSize?, maxConcurrency?, capacityWaitMs?, includeItems?, ...}` | Checkpoint-resumable structured batching across `auto` (default), `codebuddy`, `qoder`, or `zcode`, with busy-slot backoff (`capacityWaitMs`, default 5 min), automatic timeout cancellation + retry, and compact mode (`includeItems: false`). |
-| `swarm_batch_status {batchId, includeItems?}` | Read `<stateDir>/batches/<batchId>/` manifest, counts, aggregated token + `credit` usage, blockers, and optional per-item array (`includeItems`). |
+| `swarm_batch_run {batchId, task, schema, items, backend?, profile?, cwd?, ephemeral?, microbatchSize?, maxConcurrency?, reserveSlots?, maxCredit?, capacityWaitMs?, includeItems?, ...}` | Checkpoint-resumable structured batching across `auto` (default), `codebuddy`, `qoder`, or `zcode`, with credit budget caps (`maxCredit`), dynamic slot yielding (`reserveSlots`), busy-slot backoff (`capacityWaitMs`, default 5 min), machine-actionable blockers (`retryable`, `recommendedAction`), live `progress.json` heartbeats, automatic timeout cancellation + retry, and compact mode (`includeItems: false`). |
+| `swarm_batch_status {batchId, includeItems?}` | Read `<stateDir>/batches/<batchId>/` manifest, counts, aggregated token + `credit` usage, live `progress.json`, blockers, and optional per-item array (`includeItems`). |
 
 ### Legacy Core ZCode Control & Monitoring (10)
 
@@ -56,7 +56,7 @@ Detailed specification for **subagent-swarm-mcp** (legacy bin `glm-zcode-mcp`) M
 |---|---|
 | `zcode_run_structured {task, input, schema, domainRule?, model?, provider?}` | Start a ZCode session with a bounded JSON Schema contract and optional preset or declarative `domainRule`. Contract is stored in the initial user prompt. |
 | `zcode_structured_result {taskId, domainRule?}` | Recover the original contract from SQLite and validate the final JSON response (`valid`, `invalid`, `pending`, or `task_not_completed`). |
-| `zcode_batch_run {batchId, task, schema, items, domainRule?, templateId?, model?, provider?, maxConcurrency?, maxRetries?, microbatchSize?, maxBatchInputChars?, capacityWaitMs?, includeItems?}` | Run or idempotently resume a JSONL-checkpointed batch on ZCode (`backend: "zcode"`). |
+| `zcode_batch_run {batchId, task, schema, items, domainRule?, templateId?, model?, provider?, maxConcurrency?, reserveSlots?, maxRetries?, microbatchSize?, maxBatchInputChars?, capacityWaitMs?, includeItems?}` | Run or idempotently resume a JSONL-checkpointed batch on ZCode (`backend: "zcode"`), with optional `reserveSlots` yielding for concurrent interactive work. |
 | `zcode_batch_status {batchId, includeItems?}` | Read `<stateDir>/batches/<batchId>/` checkpoint manifest, per-item statuses (omitted when `includeItems: false`), deduplicated token usage, and circuit-breaker state (`blocked.json`). |
 
 ### Dispatch Hub (10) & CodeBuddy Credit (1)
@@ -72,7 +72,7 @@ Detailed specification for **subagent-swarm-mcp** (legacy bin `glm-zcode-mcp`) M
 | `hub_assign {id, worker, reason?}` | Override the scheduler and assign a queued/assigned task to `worker`. |
 | `hub_tell {id, text}` | Append a 1-line (<= 300 char) message to the task's `refs/inbox/<id>` stream. |
 | `hub_log {id}` | Read the merged, time-sorted timeline of state changes, `PROGRESS`, and `INBOX` lines. |
-| `codebuddy_usage {refresh?, sinceDays?}` | Read CodeBuddy/WorkBuddy account credit (read-only WorkBuddy billing API, 10 min cache) + local consumption from `~/.codebuddy/projects/*/*.jsonl`. |
+| `codebuddy_usage {refresh?, sinceDays?, expiringSoonDays?}` | Read CodeBuddy/WorkBuddy account credit (read-only WorkBuddy billing API, 10 min cache, with `expiringSoon` alerts) + deduplicated local consumption across both `~/.codebuddy/projects/*/*.jsonl` and `<stateDir>/cb-runs/cb_*.json` (capturing `ephemeral: true` runs), including tokens/cache-hit/reasoning breakdowns, per-model/per-profile costs, daily trends, top tasks, and burn-rate `runway`. |
 
 ---
 
@@ -118,7 +118,7 @@ ZCode's model menu groups the same model names under multiple billing routes, so
   * Built-in presets: `section-outline-v1` and `section-outline-microbatch-v1`.
   * Declarative JSON rule object: `{ arrayField, matchInputIds, uniqueField, noLevelJump, fieldConstraints }`, enforcing cross-field semantic checks without modifying repository code.
   * Optional private extensions: place untracked exports (`DOMAIN_VALIDATORS`, `TASK_SPECS`, `LOCAL_HOST_POLICY`, `LOCAL_WORKDIR_RULE`) in `local/presets.mjs` (gitignored) or point `ZCODE_MCP_LOCAL_MODULE` to a JS file (`none` disables loading).
-* **Plan B batching & recovery:** Deterministic keys `sha256(templateId + itemId + inputHash + schemaHash + domainRule)`, append-only checkpoints under `<stateDir>/batches/<batchId>/`, adaptive polling (500 ms–5 s on CLI backends, 2–5 s on ZCode), busy-slot backoff (`capacityWaitMs`, default 5 min), automatic slot cleanup + `<= 1` retry on `invalid` or `timeout`, and immediate 0-retry circuit breaking (`blocked.json`) on `quota_or_rate_limit`, `capacity_exhausted`, login/dialog blockers, or billing route mismatch (resuming a blocked batch re-runs both `quota_or_rate_limit`/`capacity_exhausted` and `pending` items). With `microbatchSize > 1`, items pack up to `maxBatchInputChars`; valid items persist immediately while only failed subset items are retried individually.
+* **Plan B batching & recovery:** Deterministic keys `sha256(templateId + itemId + inputHash + schemaHash + domainRule)`, append-only checkpoints (`manifest.jsonl`, `results.jsonl`, `progress.json`, `summary.json`, `blocked.json`) under `<stateDir>/batches/<batchId>/`, adaptive polling (500 ms–5 s on CLI backends, 2–5 s on ZCode), dynamic slot yielding (`reserveSlots`), busy-slot backoff (`capacityWaitMs`, default 5 min), credit budget cap (`maxCredit`), automatic slot cleanup + `<= 1` retry on `invalid` or `timeout`, and immediate 0-retry circuit breaking (`blocked.json`, enriched with `retryable` and `recommendedAction`: `cooldown_quota` / `wait_capacity` / `increase_credit_budget` / `check_billing_route` / `needs_human_auth`) on `quota_or_rate_limit`, `capacity_exhausted`, `credit_budget_reached`, login/dialog blockers, or billing route mismatch (resuming a blocked batch re-runs both `quota_or_rate_limit`/`capacity_exhausted` and `pending` items). With `microbatchSize > 1`, items pack up to `maxBatchInputChars`; valid items persist immediately while only failed subset items are retried individually. Use `swarm batch-export` / `zcode batch-export` to salvage already-`valid` items from `results.jsonl` after any mid-wave interruption.
 
 ---
 
@@ -131,14 +131,15 @@ All binaries are exposed via `package.json` `bin` (or `node bin/<name>.mjs`):
 * `swarm run (--file F | --text T | stdin) [--backend auto|codebuddy|qoder|zcode] [--profile lite|readonly|workspace] [--cwd DIR] [--model M] [--fallback-model M] [--ephemeral] [--wait [SEC]]`
 * `swarm run-structured --task T --schema JSON_OR_FILE --input JSON_OR_FILE [--domain-rule R] [--backend ...] [--profile ...] [--cwd DIR] [--ephemeral] [--wait [SEC]]`
 * `swarm structured-result <taskId>` | `swarm wait <taskId> [SEC]` | `swarm status|result|cancel <taskId>` | `swarm followup <taskId> (--text T | --file F | stdin) [--model M]`
-* `swarm batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1] [--backend ...] [--concurrency N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS] [--state-dir DIR] [--ephemeral] [--export OUT] [--summary OUT] [--compact]` | `swarm batch-status <batchId> [--state-dir DIR] [--compact]`
+* `swarm batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1] [--backend ...] [--concurrency N] [--reserve-slots N] [--max-credit N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS] [--state-dir DIR] [--ephemeral] [--export OUT] [--summary OUT] [--compact]`
+* `swarm batch-status <batchId> [--state-dir DIR] [--compact]` | `swarm batch-export <batchId> [--out FILE] [--spec PRESET_OR_FILE] [--input JSONL_FILE] [--state-dir DIR] [--compact]`
 
 ### `zcode` (`bin/zcode.mjs`) & `zcode-watch` (`bin/zcode-watch.mjs`)
 * `zcode run (--file F | --text T | stdin) [--model M] [--provider KEY]`
 * `zcode run-structured --task T --schema JSON_OR_FILE --input JSON_OR_FILE [--domain-rule R]`
 * `zcode structured-result <taskId> [--domain-rule R]`
-* `zcode batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1] [--concurrency N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS] [--state-dir DIR] [--export OUT] [--summary OUT] [--compact]`
-* `zcode batch-status <batchId> [--state-dir DIR] [--compact]` | `zcode status|result|cancel|list|health|quota` | `zcode followup <taskId> ...` | `zcode progress <taskId> [--refresh]`
+* `zcode batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1] [--concurrency N] [--reserve-slots N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS] [--state-dir DIR] [--model M] [--provider KEY] [--export OUT] [--summary OUT] [--compact]`
+* `zcode batch-status <batchId> [--state-dir DIR] [--compact]` | `zcode batch-export <batchId> [--out FILE] [--spec PRESET_OR_FILE] [--input JSONL_FILE] [--state-dir DIR] [--compact]` | `zcode status|result|cancel|list|health|quota` | `zcode followup <taskId> ...` | `zcode progress <taskId> [--refresh]`
 * `zcode-watch <taskId...> [--every SEC] [--timeout SEC] [--quiet]`: exits `0` when all tasks finish (`DONE`), `3` on `ATTENTION`, `4` when `--timeout` expires with tasks still running, `2` on usage error.
 
 ### `dispatch` (`bin/dispatch.mjs`) & `hub-kit/bin/hub`
@@ -148,7 +149,8 @@ All binaries are exposed via `package.json` `bin` (or `node bin/<name>.mjs`):
 * **Host policy:** Configure `HUB_HOST_POLICY` / `HUB_WORKDIR_RULE` (or `local/presets.mjs`) to inject build-host separation instructions into worker prompts; the daemon does not relocate shell commands automatically.
 
 ### `codebuddy-usage` (`bin/codebuddy-usage.mjs`)
-* `codebuddy-usage [--refresh] [--json] [--days N]` | `codebuddy-usage set-token` (saves hidden JWT with `0600` permissions).
+* `codebuddy-usage [--refresh] [--json] [--days N] [--expiring-days N] [--runs-dir DIR] [--top N]` | `codebuddy-usage set-token` (saves hidden JWT with `0600` permissions).
+* Merges local consumption across `~/.codebuddy/projects/*/*.jsonl` and `<stateDir>/cb-runs/cb_*.json` (capturing `ephemeral: true` runs while deduplicating persistent sessions), reports expiring-soon packages (`expiringSoon`), token/cache-hit/reasoning breakdowns, per-model/per-profile unit economics, daily trends, and burn-rate `runway`.
 * Token lookup order: `CODEBUDDY_USAGE_TOKEN` -> `CODEBUDDY_TOKEN_FILE` (`0600` enforced) -> CodeBuddy CLI's own `accessToken` file (never refreshed so the CLI is never logged out). Unofficial WorkBuddy web billing endpoint; may change without notice.
 
 ---
@@ -163,6 +165,8 @@ All binaries are exposed via `package.json` `bin` (or `node bin/<name>.mjs`):
 | `CODEBUDDY_MAX_RUNNING` | `4` | Concurrent running CodeBuddy task cap |
 | `CODEBUDDY_DEFAULT_CWD` | `ZCODE_MCP_PROJECT_DIR` | Default working directory for CodeBuddy tasks |
 | `CODEBUDDY_PROJECTS_DIR` | `~/.codebuddy/projects` | CodeBuddy CLI transcript root |
+| `CODEBUDDY_RUNS_DIR` | `<stateDir>/cb-runs` | Swarm CodeBuddy run state directory merged into `codebuddy-usage` |
+| `CODEBUDDY_EXPIRING_SOON_DAYS` | `7` | Window (days) for highlighting expiring active credit packages |
 | `CODEBUDDY_API_BASE` | `https://www.workbuddy.cn` | Use `https://www.workbuddy.ai` for international |
 | `QODER_BIN` | auto-discovered | Explicit path to `qodercli` binary |
 | `QODER_DEFAULT_MODEL` | `DeepSeek-Flash` | Default Qoder CLI model |

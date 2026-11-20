@@ -47,6 +47,7 @@ export function sumUsageList(list) {
     modelRequests: 0,
     credit: 0,
   };
+  let reasoningTokens = 0;
   for (const u of list) {
     if (!u) continue;
     total.inputTokens += Number(u.inputTokens ?? 0);
@@ -57,7 +58,9 @@ export function sumUsageList(list) {
     total.toolCalls += Number(u.toolCalls ?? 0);
     total.modelRequests += Number(u.modelRequests ?? 0);
     total.credit = roundCredit(total.credit + Number(u.credit ?? 0));
+    reasoningTokens += Number(u.reasoningTokens ?? 0);
   }
+  if (reasoningTokens > 0) total.reasoningTokens = reasoningTokens;
   return total;
 }
 

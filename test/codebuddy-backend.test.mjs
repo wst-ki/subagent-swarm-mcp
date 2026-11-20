@@ -280,6 +280,28 @@ test("parseCodebuddyJsonOutput deduplicates rawUsage by messageId and handles er
   assert.equal(errParsed.ok, false);
   assert.equal(errParsed.isError, true);
   assert.deepEqual(errParsed.errors, ["hit max turns"]);
+
+  // Real CodeBuddy events expose model under providerData.model / requestModelId and thinking tokens
+  const pdParsed = parseCodebuddyJsonOutput(JSON.stringify([
+    {
+      type: "message",
+      providerData: {
+        messageId: "m_pd",
+        model: "deepseek-v4.1-flash",
+        rawUsage: {
+          prompt_tokens: 1000,
+          completion_tokens: 150,
+          completion_thinking_tokens: 45,
+          prompt_cache_hit_tokens: 600,
+          credit: 0.12,
+        },
+      },
+    },
+    { type: "result", subtype: "success", is_error: false, result: "ok" },
+  ]));
+  assert.equal(pdParsed.model, "deepseek-v4.1-flash");
+  assert.equal(pdParsed.usage.reasoningTokens, 45);
+  assert.equal(pdParsed.usage.credit, 0.12);
 });
 
 test("inspectSessionJsonl tracks active tool calls and honors fromOffset", () => {

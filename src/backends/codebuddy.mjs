@@ -231,6 +231,7 @@ export function parseCodebuddyJsonOutput(stdout) {
   const seenMsgIds = new Set();
   let rawPrompt = 0;
   let rawCompletion = 0;
+  let rawReasoning = 0;
   let rawCacheRead = 0;
   let rawCacheWrite = 0;
   let credit = 0;
@@ -241,6 +242,8 @@ export function parseCodebuddyJsonOutput(stdout) {
     if (typeof ev.session_id === "string" && ev.session_id) detectedSessionId = ev.session_id;
     if (typeof ev.model === "string" && ev.model) detectedModel = ev.model;
     if (typeof ev.message?.model === "string" && ev.message.model) detectedModel = ev.message.model;
+    if (typeof ev.providerData?.model === "string" && ev.providerData.model) detectedModel = ev.providerData.model;
+    else if (typeof ev.providerData?.requestModelId === "string" && ev.providerData.requestModelId) detectedModel = ev.providerData.requestModelId;
 
     if (ev.type === "function_call") {
       toolCalls++;
@@ -265,6 +268,7 @@ export function parseCodebuddyJsonOutput(stdout) {
         const ru = p.rawUsage;
         rawPrompt += Number(ru.prompt_tokens ?? ru.input_tokens ?? 0);
         rawCompletion += Number(ru.completion_tokens ?? ru.output_tokens ?? 0);
+        rawReasoning += Number(ru.completion_thinking_tokens ?? ru.completion_tokens_details?.reasoning_tokens ?? 0);
         rawCacheRead += Number(ru.prompt_cache_hit_tokens ?? ru.cache_read_input_tokens ?? 0);
         rawCacheWrite += Number(ru.cache_creation_input_tokens ?? ru.cache_write_input_tokens ?? 0);
         credit = roundCredit(credit + Number(ru.credit ?? 0));
@@ -319,6 +323,7 @@ export function parseCodebuddyJsonOutput(stdout) {
       toolCalls,
       modelRequests,
       credit,
+      ...(rawReasoning > 0 ? { reasoningTokens: rawReasoning } : {}),
     },
   };
 }
@@ -624,6 +629,12 @@ export async function health({ env = process.env, isPidAlive = defaultIsPidAlive
   return out;
 }
 
-export async function quota({ refresh = false, sinceDays = 7 } = {}) {
-  return codebuddyUsage({ refresh, sinceDays });
+export async function quota({ refresh = false, sinceDays = 7, env = process.env } = {}) {
+  const cfg = cbBackendConfig(env);
+  return codebuddyUsage({
+    refresh,
+    sinceDays,
+    projectsDir: cfg.projectsDir,
+    runsDir: cfg.runsDir,
+  });
 }

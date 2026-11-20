@@ -30,7 +30,7 @@ import {
   swarmWait,
 } from "./backends/registry.mjs";
 
-const server = new McpServer({ name: "subagent-swarm-mcp", version: "0.2.0" });
+const server = new McpServer({ name: "subagent-swarm-mcp", version: "0.3.0" });
 
 const ok = (obj) => ({ content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: `Error: ${e?.message ?? e}` }] });
@@ -87,6 +87,7 @@ server.registerTool(
       model: model.optional(),
       provider: z.string().optional(),
       maxConcurrency: z.number().int().min(1).max(config.maxRunning).optional(),
+      reserveSlots: z.number().int().min(0).max(Math.max(0, config.maxRunning - 1)).optional(),
       maxRetries: z.number().int().min(0).max(1).optional(),
       pollIntervalMs: z.number().int().min(500).max(10000).optional(),
       itemTimeoutMs: z.number().int().min(5000).max(300000).optional(),
@@ -553,18 +554,21 @@ server.registerTool(
 server.registerTool(
   "codebuddy_usage",
   {
-    title: "CodeBuddy credit",
+    title: "CodeBuddy credit & cost analytics",
     description:
-      "CodeBuddy/WorkBuddy credit left on the account (billing API, cached 10 min; needs the user's access token, see README) and " +
-      "credit consumed on this machine by the CodeBuddy CLI per day and per hub task (from its local transcripts). " +
-      "Returns { remote: { remain, total, pct, packages } | { error, last }, token, local }.",
+      "CodeBuddy/WorkBuddy account credit (read-only billing API, cached 10 min, with expiring-soon package alerts) + " +
+      "deduplicated local consumption across both CLI JSONL transcripts and swarm cb-runs state files (including ephemeral runs): " +
+      "tokens & cache-hit rate, per-model/per-profile unit economics, daily breakdown, top tasks, and burn-rate runway forecast.",
     inputSchema: {
       refresh: z.boolean().optional().describe("Skip the cache and ask the billing API now."),
       sinceDays: z.number().int().min(1).max(90).optional().describe("Local consumption window, default 7."),
+      expiringSoonDays: z.number().int().min(1).max(90).optional().describe("Expiring-package warning window in days, default 7."),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  guard(async ({ refresh = false, sinceDays = 7 }) => codebuddyUsage({ refresh, sinceDays })),
+  guard(async ({ refresh = false, sinceDays = 7, expiringSoonDays }) =>
+    codebuddyUsage({ refresh, sinceDays, ...(expiringSoonDays !== undefined ? { expiringSoonDays } : {}) }),
+  ),
 );
 
 // ------------------------------------------------------------------ swarm tools
@@ -798,6 +802,8 @@ server.registerTool(
       model: swarmModel.optional(),
       provider: z.string().optional(),
       maxConcurrency: z.number().int().min(1).max(8).optional(),
+      reserveSlots: z.number().int().min(0).max(7).optional(),
+      maxCredit: z.number().positive().optional(),
       maxRetries: z.number().int().min(0).max(1).optional(),
       pollIntervalMs: z.number().int().min(250).max(10000).optional(),
       itemTimeoutMs: z.number().int().min(5000).max(300000).optional(),

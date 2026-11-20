@@ -1,10 +1,12 @@
 // CodeBuddy credit: what is left on the account (WorkBuddy's billing API, called with the user's
-// own access token) and what this machine has consumed (the CodeBuddy CLI's local session transcripts).
+// own access token) and what this machine has consumed (both CodeBuddy CLI's local session
+// transcripts under ~/.codebuddy/projects/ and swarm runner state files under <stateDir>/cb-runs/,
+// deduplicated so persistent runs are never double-counted while ephemeral runs are fully captured).
 // The remote request follows github.com/wwenc6621/CodeBuddy-Usage (MIT). It is read-only: no
 // check-in, no reward claiming. The token is never printed, logged or written to the cache.
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { config } from "./config.mjs";
 
 const env = process.env;
@@ -22,7 +24,9 @@ export const cbConfig = {
     ),
   cacheFile: join(config.stateDir, "codebuddy-usage.json"),
   projectsDir: env.CODEBUDDY_PROJECTS_DIR ?? join(homedir(), ".codebuddy", "projects"),
+  runsDir: env.CODEBUDDY_RUNS_DIR ?? join(config.stateDir, "cb-runs"),
   maxAgeSec: Number(env.CODEBUDDY_USAGE_MAX_AGE_SEC ?? 600),
+  expiringSoonDays: Number(env.CODEBUDDY_EXPIRING_SOON_DAYS ?? 7),
 };
 
 // Package codes the billing page asks for (copied from CodeBuddy-Usage; update if packages go missing).
@@ -37,6 +41,11 @@ const PACKAGE_CODES = [
 ];
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
+
+const CB_RUN_FILE_RE = /^cb_[\w-]+\.json$/;
+const r1 = (n) => Math.round(n * 10) / 10;
+const r2 = (n) => Math.round(n * 100) / 100;
+const r4 = (n) => Math.round(n * 10000) / 10000;
 
 function jwtExpiry(token) {
   try {
@@ -84,9 +93,56 @@ export function saveToken(token, file = cbConfig.tokenFile) {
 
 const num = (s) => parseFloat(s ?? "0") || 0;
 
+export function parsePackageExpiryMs(expires) {
+  if (typeof expires !== "string" || !expires.trim()) return null;
+  const s = expires.trim();
+  const iso = /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?$/.test(s) ? s.replace(/\s+/, "T") : s;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function annotateAccountSummary(summary, { now = Date.now(), expiringSoonDays = cbConfig.expiringSoonDays } = {}) {
+  if (!summary || !Array.isArray(summary.packages)) return summary;
+  const windowMs = Math.max(0, Number(expiringSoonDays) || 0) * 86_400_000;
+  let expiringCredit = 0;
+  const expiringPackages = [];
+  const annotatedPackages = summary.packages.map((p) => {
+    const remain = Number(p.remain ?? 0);
+    const size = Number(p.size ?? 0);
+    const used = r2(Math.max(0, size - remain));
+    const usedPct = size > 0 ? r2((100 * used) / size) : 0;
+    const expiresMs = parsePackageExpiryMs(p.expires);
+    const diffMs = expiresMs != null ? expiresMs - now : null;
+    const daysLeft = diffMs != null ? r1(diffMs / 86_400_000) : null;
+    const expiringSoon = Boolean(remain > 0 && diffMs != null && diffMs >= 0 && diffMs <= windowMs);
+    const next = { ...p, used, usedPct, daysLeft, expiringSoon };
+    if (expiringSoon) {
+      expiringCredit += remain;
+      expiringPackages.push({ name: next.name, remain: r2(remain), size: r2(size), expires: next.expires, daysLeft });
+    }
+    return next;
+  });
+  const activePackages = annotatedPackages.filter((p) => p.remain > 0).length;
+  const used = r2(Math.max(0, Number(summary.total ?? 0) - Number(summary.remain ?? 0)));
+  return {
+    ...summary,
+    used,
+    activePackages,
+    packages: annotatedPackages,
+    expiringSoon: {
+      withinDays: Math.max(0, Number(expiringSoonDays) || 0),
+      credit: r2(expiringCredit),
+      count: expiringPackages.length,
+      nextExpiry: expiringPackages[0]?.expires ?? null,
+      nextExpiryDays: expiringPackages[0]?.daysLeft ?? null,
+      packages: expiringPackages,
+    },
+  };
+}
+
 // Same rules as CodeBuddy-Usage: prefer the current-cycle fields (monthly packages refill next
 // cycle, so future credit is not "left now"), and only packages with credit left count in total.
-export function summarizeAccounts(accounts = []) {
+export function summarizeAccounts(accounts = [], { now = Date.now(), expiringSoonDays = cbConfig.expiringSoonDays } = {}) {
   let remain = 0;
   let total = 0;
   const packages = [];
@@ -99,11 +155,18 @@ export function summarizeAccounts(accounts = []) {
     packages.push({ name: a.PackageName ?? "-", remain: r, size: s, expires: a.CycleEndTime ?? null });
   }
   packages.sort((x, y) => (y.remain > 0) - (x.remain > 0) || String(x.expires).localeCompare(String(y.expires)));
-  const round = (n) => Math.round(n * 100) / 100;
-  return { remain: round(remain), total: round(total), pct: total > 0 ? round((100 * remain) / total) : 0, packages };
+  const base = { remain: r2(remain), total: r2(total), pct: total > 0 ? r2((100 * remain) / total) : 0, packages };
+  return annotateAccountSummary(base, { now, expiringSoonDays });
 }
 
-export async function fetchRemote({ token, apiBase = cbConfig.apiBase, fetchImpl = fetch, timeoutMs = 15_000 }) {
+export async function fetchRemote({
+  token,
+  apiBase = cbConfig.apiBase,
+  fetchImpl = fetch,
+  timeoutMs = 15_000,
+  now = Date.now(),
+  expiringSoonDays = cbConfig.expiringSoonDays,
+}) {
   const resp = await fetchImpl(`${apiBase}/billing/meter/get-user-resource`, {
     method: "POST",
     headers: {
@@ -133,53 +196,514 @@ export async function fetchRemote({ token, apiBase = cbConfig.apiBase, fetchImpl
   if (r?.Error) throw new Error(`billing API error: ${r.Error.Code ?? ""} ${r.Error.Message ?? ""}`.trim());
   const accounts = r?.Data?.Accounts;
   if (!Array.isArray(accounts)) throw new Error("billing API: unexpected response shape");
-  return summarizeAccounts(accounts);
+  return summarizeAccounts(accounts, { now, expiringSoonDays });
 }
 
-// Credit consumed per day and per hub task, from ~/.codebuddy/projects/<cwd>/<sid>.jsonl. Each
-// model request carries providerData.rawUsage (credit, prompt_tokens = context size at that step);
-// one request can span several lines, so dedupe by messageId.
-export function localUsage({ projectsDir = cbConfig.projectsDir, sinceMs = 0 } = {}) {
-  const out = { credit: 0, requests: 0, byDay: {}, byTask: {} };
-  if (!existsSync(projectsDir)) return out;
-  for (const dir of readdirSync(projectsDir)) {
-    const full = join(projectsDir, dir);
-    if (!statSync(full).isDirectory()) continue;
-    const task = dir.match(/work-(T\d{8}-\d{6}-[a-z0-9]+)$/)?.[1] ?? null;
-    for (const f of readdirSync(full).filter((n) => n.endsWith(".jsonl"))) {
-      if (statSync(join(full, f)).mtimeMs < sinceMs) continue;
-      const seen = new Set();
-      for (const line of readFileSync(join(full, f), "utf8").split("\n")) {
-        if (!line.includes('"rawUsage"')) continue;
-        let x;
+function localDayKey(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function safeReadJson(file) {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function makeTokenBucket() {
+  return {
+    inputTokens: 0,
+    uncachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheWriteInputTokens: 0,
+    totalTokens: 0,
+  };
+}
+
+function addTokens(bucket, tok) {
+  bucket.inputTokens += tok.inputTokens;
+  bucket.uncachedInputTokens += tok.uncachedInputTokens;
+  bucket.outputTokens += tok.outputTokens;
+  bucket.reasoningTokens += tok.reasoningTokens;
+  bucket.cacheReadInputTokens += tok.cacheReadInputTokens;
+  bucket.cacheWriteInputTokens += tok.cacheWriteInputTokens;
+  bucket.totalTokens += tok.totalTokens;
+}
+
+function cacheHitPct(inputTokens, cacheReadInputTokens) {
+  if (inputTokens <= 0) return 0;
+  return r2(Math.min(100, (100 * cacheReadInputTokens) / inputTokens));
+}
+
+function extractRawUsageTokens(ru) {
+  const cacheRead = Number(
+    ru.prompt_cache_hit_tokens ?? ru.cache_read_input_tokens ?? ru.prompt_tokens_details?.cached_tokens ?? 0,
+  );
+  const cacheWrite = Number(ru.cache_creation_input_tokens ?? ru.prompt_cache_write_tokens ?? 0);
+  const rawPrompt = Number(ru.prompt_tokens ?? ru.input_tokens ?? 0);
+  const miss = ru.prompt_cache_miss_tokens != null ? Number(ru.prompt_cache_miss_tokens) : null;
+  const inputTokens =
+    miss != null
+      ? Math.max(rawPrompt, miss + cacheRead)
+      : cacheRead > rawPrompt
+        ? rawPrompt + cacheRead + cacheWrite
+        : rawPrompt;
+  const uncachedInputTokens = miss != null ? Math.max(0, miss) : Math.max(0, inputTokens - cacheRead);
+  const outputTokens = Number(ru.completion_tokens ?? ru.output_tokens ?? 0);
+  const reasoningTokens = Number(
+    ru.completion_thinking_tokens ?? ru.completion_tokens_details?.reasoning_tokens ?? 0,
+  );
+  const totalTokens = Number(ru.total_tokens ?? inputTokens + outputTokens);
+  return {
+    inputTokens,
+    uncachedInputTokens,
+    outputTokens,
+    reasoningTokens,
+    cacheReadInputTokens: cacheRead,
+    cacheWriteInputTokens: cacheWrite,
+    totalTokens,
+    peakContext: rawPrompt || inputTokens,
+  };
+}
+
+function extractStateUsageTokens(u) {
+  const rawIn = Number(u.inputTokens ?? 0);
+  const outputTokens = Number(u.outputTokens ?? 0);
+  const cacheRead = Number(u.cacheReadInputTokens ?? 0);
+  const cacheWrite = Number(u.cacheWriteInputTokens ?? 0);
+  const reasoningTokens = Number(u.reasoningTokens ?? 0);
+  // CodeBuddy CLI reports input_tokens inclusive of cache_read_input_tokens; handle both inclusive & exclusive safely.
+  const inputTokens = cacheRead > rawIn ? rawIn + cacheRead + cacheWrite : rawIn;
+  const uncachedInputTokens = Math.max(0, inputTokens - cacheRead);
+  const totalTokens = inputTokens + outputTokens;
+  return {
+    inputTokens,
+    uncachedInputTokens,
+    outputTokens,
+    reasoningTokens,
+    cacheReadInputTokens: cacheRead,
+    cacheWriteInputTokens: cacheWrite,
+    totalTokens,
+    peakContext: inputTokens,
+  };
+}
+
+// Local consumption from both ~/.codebuddy/projects/<cwd>/<sid>.jsonl (interactive CLI, hub workers,
+// and persistent swarm sessions) and <stateDir>/cb-runs/cb_*.json (ephemeral swarm runs and any
+// persisted swarm runs whose JSONL is no longer present). Persistent swarm runs already counted
+// from JSONL are automatically deduplicated by sessionFile / sessionId / taskId.
+export function localUsage({
+  projectsDir = cbConfig.projectsDir,
+  runsDir = cbConfig.runsDir,
+  sinceMs = 0,
+  topLimit = 10,
+} = {}) {
+  const out = {
+    credit: 0,
+    requests: 0,
+    tasks: 0,
+    tokens: { ...makeTokenBucket(), cacheHitRatePct: 0 },
+    byDay: {},
+    daily: [],
+    byTask: {},
+    byModel: {},
+    byProfile: {},
+    bySource: {
+      cli: { credit: 0, requests: 0, tasks: 0 },
+      hub: { credit: 0, requests: 0, tasks: 0 },
+      swarm: { credit: 0, requests: 0, tasks: 0, ephemeralTasks: 0, persistentTasks: 0 },
+    },
+    swarmRuns: {
+      total: 0,
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+      ephemeral: 0,
+      persistent: 0,
+      zeroTokenCompleted: 0,
+    },
+    topSwarmTasks: [],
+  };
+
+  // Step 1: Index swarm runner state files (<stateDir>/cb-runs/cb_*.json).
+  const cbRuns = [];
+  const cbBySessionFile = new Map();
+  const cbBySessionId = new Map();
+  if (runsDir && existsSync(runsDir)) {
+    for (const f of readdirSync(runsDir)) {
+      if (!CB_RUN_FILE_RE.test(f)) continue;
+      const run = safeReadJson(join(runsDir, f));
+      if (!run || typeof run.taskId !== "string") continue;
+      cbRuns.push(run);
+      if (run.sessionFile) cbBySessionFile.set(resolve(run.sessionFile), run);
+      if (run.sessionId) cbBySessionId.set(run.sessionId, run);
+      cbBySessionId.set(run.taskId, run);
+    }
+  }
+
+  const allSessionKeys = new Set();
+  const dayBuckets = new Map();
+  const modelBuckets = new Map();
+  const profileBuckets = new Map();
+  const sourceSessions = {
+    cli: new Set(),
+    hub: new Set(),
+    swarm: new Set(),
+    swarmEphemeral: new Set(),
+    swarmPersistent: new Set(),
+  };
+  const swarmTaskStats = new Map();
+
+  function recordEvent({ ts, credit, requests = 1, model = "unknown", source = "cli", profile = "cli", sessionKey, hubTask = null, swarmRun = null, tok, durationMs = null }) {
+    const day = localDayKey(ts);
+    out.credit += credit;
+    out.requests += requests;
+    addTokens(out.tokens, tok);
+    out.byDay[day] = (out.byDay[day] ?? 0) + credit;
+
+    if (sessionKey) allSessionKeys.add(sessionKey);
+
+    let db = dayBuckets.get(day);
+    if (!db) {
+      db = { date: day, credit: 0, requests: 0, sessions: new Set(), tokens: makeTokenBucket() };
+      dayBuckets.set(day, db);
+    }
+    db.credit += credit;
+    db.requests += requests;
+    if (sessionKey) db.sessions.add(sessionKey);
+    addTokens(db.tokens, tok);
+
+    const modelKey = model || "unknown";
+    let mb = modelBuckets.get(modelKey);
+    if (!mb) {
+      mb = { credit: 0, requests: 0, sessions: new Set(), tokens: makeTokenBucket(), peakContext: 0 };
+      modelBuckets.set(modelKey, mb);
+    }
+    mb.credit += credit;
+    mb.requests += requests;
+    if (sessionKey) mb.sessions.add(sessionKey);
+    addTokens(mb.tokens, tok);
+    mb.peakContext = Math.max(mb.peakContext, tok.peakContext ?? 0);
+
+    const profKey = profile || source;
+    let pb = profileBuckets.get(profKey);
+    if (!pb) {
+      pb = { credit: 0, requests: 0, sessions: new Set(), totalTokens: 0 };
+      profileBuckets.set(profKey, pb);
+    }
+    pb.credit += credit;
+    pb.requests += requests;
+    if (sessionKey) pb.sessions.add(sessionKey);
+    pb.totalTokens += tok.totalTokens;
+
+    const src = out.bySource[source] ?? out.bySource.cli;
+    src.credit += credit;
+    src.requests += requests;
+    if (sessionKey && sourceSessions[source]) {
+      sourceSessions[source].add(sessionKey);
+      if (source === "swarm") {
+        if (swarmRun?.ephemeral) sourceSessions.swarmEphemeral.add(sessionKey);
+        else sourceSessions.swarmPersistent.add(sessionKey);
+      }
+    }
+
+    if (hubTask) {
+      const t = (out.byTask[hubTask] ??= { credit: 0, requests: 0, peakContext: 0 });
+      t.credit += credit;
+      t.requests += requests;
+      t.peakContext = Math.max(t.peakContext, tok.peakContext ?? 0);
+    }
+
+    if (swarmRun) {
+      let st = swarmTaskStats.get(swarmRun.taskId);
+      if (!st) {
+        const fallbackDur =
+          swarmRun.endedAt && swarmRun.startedAt ? Math.max(0, swarmRun.endedAt - swarmRun.startedAt) : null;
+        st = {
+          taskId: swarmRun.taskId,
+          model: modelKey,
+          profile: swarmRun.profile ?? "lite",
+          ephemeral: Boolean(swarmRun.ephemeral),
+          status: swarmRun.status ?? "unknown",
+          credit: 0,
+          requests: 0,
+          inputTokens: 0,
+          cacheReadInputTokens: 0,
+          totalTokens: 0,
+          durationMs: durationMs ?? fallbackDur,
+          startedAt: swarmRun.createdAt ?? (swarmRun.startedAt ? new Date(swarmRun.startedAt).toISOString() : null),
+        };
+        swarmTaskStats.set(swarmRun.taskId, st);
+      }
+      st.credit += credit;
+      st.requests += requests;
+      st.inputTokens += tok.inputTokens;
+      st.cacheReadInputTokens += tok.cacheReadInputTokens;
+      st.totalTokens += tok.totalTokens;
+      if (modelKey !== "unknown") st.model = modelKey;
+    }
+  }
+
+  // Step 2: Scan CodeBuddy CLI JSONL session transcripts (~/.codebuddy/projects/<cwd>/<sid>.jsonl).
+  const ingestedCbTaskIds = new Set();
+  if (projectsDir && existsSync(projectsDir)) {
+    for (const dir of readdirSync(projectsDir)) {
+      const full = join(projectsDir, dir);
+      let isDir = false;
+      try {
+        isDir = statSync(full).isDirectory();
+      } catch {
+        continue;
+      }
+      if (!isDir) continue;
+      const hubTask = dir.match(/work-(T\d{8}-\d{6}-[a-z0-9]+)$/)?.[1] ?? null;
+      for (const f of readdirSync(full).filter((n) => n.endsWith(".jsonl"))) {
+        const filePath = join(full, f);
         try {
-          x = JSON.parse(line);
+          if (statSync(filePath).mtimeMs < sinceMs) continue;
         } catch {
           continue;
         }
-        const p = x.providerData;
-        if (!p?.rawUsage || !p.messageId || seen.has(p.messageId) || (x.timestamp ?? 0) < sinceMs) continue;
-        seen.add(p.messageId);
-        const c = p.rawUsage.credit ?? 0;
-        const d = new Date(x.timestamp);
-        const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-        out.credit += c;
-        out.requests++;
-        out.byDay[day] = (out.byDay[day] ?? 0) + c;
-        if (task) {
-          const t = (out.byTask[task] ??= { credit: 0, requests: 0, peakContext: 0 });
-          t.credit += c;
-          t.requests++;
-          t.peakContext = Math.max(t.peakContext, p.rawUsage.prompt_tokens ?? 0);
+        const stem = f.slice(0, -6);
+        let matchedCb = cbBySessionFile.get(resolve(filePath)) ?? cbBySessionId.get(stem) ?? null;
+        const seen = new Set();
+        for (const line of readFileSync(filePath, "utf8").split("\n")) {
+          if (!line.includes('"rawUsage"')) continue;
+          let x;
+          try {
+            x = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const p = x.providerData;
+          if (!p?.rawUsage || !p.messageId || seen.has(p.messageId) || (x.timestamp ?? 0) < sinceMs) continue;
+          seen.add(p.messageId);
+          if (!matchedCb && typeof x.sessionId === "string") {
+            matchedCb = cbBySessionId.get(x.sessionId) ?? null;
+          }
+          if (matchedCb) ingestedCbTaskIds.add(matchedCb.taskId);
+
+          const c = Number(p.rawUsage.credit ?? 0);
+          const tok = extractRawUsageTokens(p.rawUsage);
+          const model =
+            p.model ?? p.requestModelId ?? x.message?.model ?? matchedCb?.actualModel ?? matchedCb?.model ?? "unknown";
+          const source = matchedCb ? "swarm" : hubTask ? "hub" : "cli";
+          const profile = matchedCb?.profile ?? (hubTask ? "hub" : "cli");
+          const sessionKey = matchedCb
+            ? `swarm:${matchedCb.taskId}`
+            : hubTask
+              ? `hub:${hubTask}`
+              : `cli:${dir}/${stem}`;
+          recordEvent({
+            ts: x.timestamp,
+            credit: c,
+            requests: 1,
+            model,
+            source,
+            profile,
+            sessionKey,
+            hubTask,
+            swarmRun: matchedCb,
+            tok,
+          });
         }
       }
     }
   }
-  const r2 = (n) => Math.round(n * 100) / 100;
+
+  // Step 3: Ingest swarm runner state files not already counted from JSONL (especially ephemeral runs).
+  for (const run of cbRuns) {
+    const runTs = run.endedAt ?? run.startedAt ?? 0;
+    if (runTs >= sinceMs) {
+      out.swarmRuns.total++;
+      if (run.status === "completed") out.swarmRuns.completed++;
+      else if (run.status === "failed") out.swarmRuns.failed++;
+      else if (run.status === "cancelled") out.swarmRuns.cancelled++;
+      if (run.ephemeral) out.swarmRuns.ephemeral++;
+      else out.swarmRuns.persistent++;
+      if (
+        run.status === "completed" &&
+        Number(run.usage?.totalTokens ?? 0) === 0 &&
+        Number(run.usage?.credit ?? 0) === 0
+      ) {
+        out.swarmRuns.zeroTokenCompleted++;
+      }
+    }
+
+    if (ingestedCbTaskIds.has(run.taskId)) continue;
+
+    const turns =
+      Array.isArray(run.turns) && run.turns.length > 0
+        ? run.turns
+        : run.usage
+          ? [
+              {
+                startedAt: run.startedAt,
+                endedAt: run.endedAt,
+                durationMs: run.endedAt && run.startedAt ? Math.max(0, run.endedAt - run.startedAt) : null,
+                usage: run.usage,
+              },
+            ]
+          : [];
+
+    for (const turn of turns) {
+      const ts = turn.endedAt ?? turn.startedAt ?? runTs;
+      if (!ts || ts < sinceMs) continue;
+      const u = turn.usage;
+      if (!u) continue;
+      const c = Number(u.credit ?? 0);
+      const reqs = Number(u.modelRequests ?? 0);
+      const tok = extractStateUsageTokens(u);
+      if (reqs === 0 && c === 0 && tok.totalTokens === 0) continue;
+      const model = run.actualModel || run.model || "unknown";
+      recordEvent({
+        ts,
+        credit: c,
+        requests: reqs > 0 ? reqs : 1,
+        model,
+        source: "swarm",
+        profile: run.profile ?? "lite",
+        sessionKey: `swarm:${run.taskId}`,
+        swarmRun: run,
+        tok,
+        durationMs: Number.isFinite(turn.durationMs) ? turn.durationMs : null,
+      });
+    }
+  }
+
+  // Finalize & round all aggregates cleanly.
   out.credit = r2(out.credit);
+  out.tasks = allSessionKeys.size;
+  out.tokens.cacheHitRatePct = cacheHitPct(out.tokens.inputTokens, out.tokens.cacheReadInputTokens);
+
   for (const k of Object.keys(out.byDay)) out.byDay[k] = r2(out.byDay[k]);
   for (const t of Object.values(out.byTask)) t.credit = r2(t.credit);
+
+  out.daily = [...dayBuckets.values()]
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((db) => ({
+      date: db.date,
+      credit: r2(db.credit),
+      requests: db.requests,
+      tasks: db.sessions.size,
+      inputTokens: db.tokens.inputTokens,
+      outputTokens: db.tokens.outputTokens,
+      cacheReadInputTokens: db.tokens.cacheReadInputTokens,
+      totalTokens: db.tokens.totalTokens,
+      cacheHitRatePct: cacheHitPct(db.tokens.inputTokens, db.tokens.cacheReadInputTokens),
+    }));
+
+  const sortedModels = [...modelBuckets.entries()].sort((a, b) => b[1].credit - a[1].credit || b[1].requests - a[1].requests);
+  for (const [m, mb] of sortedModels) {
+    const tasks = mb.sessions.size;
+    out.byModel[m] = {
+      credit: r2(mb.credit),
+      requests: mb.requests,
+      tasks,
+      avgCreditPerTask: tasks > 0 ? r4(mb.credit / tasks) : 0,
+      avgCreditPerRequest: mb.requests > 0 ? r4(mb.credit / mb.requests) : 0,
+      inputTokens: mb.tokens.inputTokens,
+      uncachedInputTokens: mb.tokens.uncachedInputTokens,
+      outputTokens: mb.tokens.outputTokens,
+      reasoningTokens: mb.tokens.reasoningTokens,
+      cacheReadInputTokens: mb.tokens.cacheReadInputTokens,
+      totalTokens: mb.tokens.totalTokens,
+      cacheHitRatePct: cacheHitPct(mb.tokens.inputTokens, mb.tokens.cacheReadInputTokens),
+      peakContext: mb.peakContext,
+    };
+  }
+
+  const sortedProfiles = [...profileBuckets.entries()].sort((a, b) => b[1].credit - a[1].credit || b[1].requests - a[1].requests);
+  for (const [p, pb] of sortedProfiles) {
+    const tasks = pb.sessions.size;
+    out.byProfile[p] = {
+      credit: r2(pb.credit),
+      requests: pb.requests,
+      tasks,
+      avgCreditPerTask: tasks > 0 ? r4(pb.credit / tasks) : 0,
+      totalTokens: pb.totalTokens,
+    };
+  }
+
+  out.bySource.cli.credit = r2(out.bySource.cli.credit);
+  out.bySource.cli.tasks = sourceSessions.cli.size;
+  out.bySource.hub.credit = r2(out.bySource.hub.credit);
+  out.bySource.hub.tasks = sourceSessions.hub.size;
+  out.bySource.swarm.credit = r2(out.bySource.swarm.credit);
+  out.bySource.swarm.tasks = sourceSessions.swarm.size;
+  out.bySource.swarm.ephemeralTasks = sourceSessions.swarmEphemeral.size;
+  out.bySource.swarm.persistentTasks = sourceSessions.swarmPersistent.size;
+
+  out.topSwarmTasks = [...swarmTaskStats.values()]
+    .sort((a, b) => b.credit - a.credit || b.totalTokens - a.totalTokens)
+    .slice(0, Math.max(0, topLimit))
+    .map((st) => ({
+      taskId: st.taskId,
+      model: st.model,
+      profile: st.profile,
+      ephemeral: st.ephemeral,
+      status: st.status,
+      credit: r4(st.credit),
+      requests: st.requests,
+      totalTokens: st.totalTokens,
+      cacheHitRatePct: cacheHitPct(st.inputTokens, st.cacheReadInputTokens),
+      durationMs: st.durationMs,
+      startedAt: st.startedAt,
+    }));
+
   return out;
+}
+
+export function computeRunway(remote, local, { sinceDays = 7 } = {}) {
+  const rem = remote?.error ? remote.last : remote;
+  const windowDays = Math.max(1, Number(sinceDays) || 7);
+  const activeDays = Object.values(local?.byDay ?? {}).filter((c) => Number(c) > 0).length;
+  const avgDailyCredit = r2((local?.credit ?? 0) / windowDays);
+  const activeDayAvgCredit = activeDays > 0 ? r2((local?.credit ?? 0) / activeDays) : 0;
+  const remainingCredit = rem && Number.isFinite(rem.remain) ? rem.remain : null;
+  const estimatedDaysRemaining =
+    remainingCredit != null && avgDailyCredit > 0 ? r1(remainingCredit / avgDailyCredit) : null;
+  const estimatedActiveDaysRemaining =
+    remainingCredit != null && activeDayAvgCredit > 0 ? r1(remainingCredit / activeDayAvgCredit) : null;
+
+  const estimatedTasksRemainingByModel = {};
+  if (remainingCredit != null && local?.byModel) {
+    for (const [model, stats] of Object.entries(local.byModel)) {
+      if (stats.avgCreditPerTask > 0) {
+        estimatedTasksRemainingByModel[model] = {
+          avgCreditPerTask: stats.avgCreditPerTask,
+          estimatedTasksRemaining: Math.floor(remainingCredit / stats.avgCreditPerTask),
+        };
+      }
+    }
+  }
+
+  let expiringRisk = null;
+  if (rem?.expiringSoon?.credit > 0 && rem.expiringSoon.nextExpiryDays != null) {
+    const pace = Math.max(avgDailyCredit, activeDayAvgCredit);
+    const projectedUse = r2(pace * Math.max(0, rem.expiringSoon.nextExpiryDays));
+    expiringRisk = {
+      expiringCredit: rem.expiringSoon.credit,
+      nextExpiry: rem.expiringSoon.nextExpiry,
+      nextExpiryDays: rem.expiringSoon.nextExpiryDays,
+      likelyUnusedCredit: r2(Math.max(0, rem.expiringSoon.credit - projectedUse)),
+    };
+  }
+
+  return {
+    windowDays,
+    activeDays,
+    avgDailyCredit,
+    activeDayAvgCredit,
+    estimatedDaysRemaining,
+    estimatedActiveDaysRemaining,
+    expiringRisk,
+    estimatedTasksRemainingByModel,
+  };
 }
 
 function readCache(file) {
@@ -190,10 +714,20 @@ function readCache(file) {
   }
 }
 
-// Remaining (cached for maxAgeSec unless refresh) + local consumption. Never throws for a remote
-// failure: `remote.error` says what went wrong and `remote.last` keeps the last good reading.
-export async function codebuddyUsage({ refresh = false, maxAgeSec = cbConfig.maxAgeSec, sinceDays = 7, fetchImpl, now = Date.now() } = {}) {
-  const local = localUsage({ sinceMs: now - sinceDays * 86_400_000 });
+// Remaining (cached for maxAgeSec unless refresh) + local consumption + runway forecast. Never
+// throws for a remote failure: `remote.error` says what went wrong and `remote.last` keeps the last
+// good reading.
+export async function codebuddyUsage({
+  refresh = false,
+  maxAgeSec = cbConfig.maxAgeSec,
+  sinceDays = 7,
+  expiringSoonDays = cbConfig.expiringSoonDays,
+  projectsDir = cbConfig.projectsDir,
+  runsDir = cbConfig.runsDir,
+  fetchImpl,
+  now = Date.now(),
+} = {}) {
+  const local = localUsage({ projectsDir, runsDir, sinceMs: now - sinceDays * 86_400_000 });
   const cache = readCache(cbConfig.cacheFile);
   let remote;
   let tokenInfo = null;
@@ -201,17 +735,28 @@ export async function codebuddyUsage({ refresh = false, maxAgeSec = cbConfig.max
     const tok = readToken();
     if (tok) tokenInfo = { source: tok.source, expiresAt: tok.expiresAt ? new Date(tok.expiresAt).toISOString() : null };
     if (!refresh && cache?.fetchedAt && now - cache.fetchedAt < maxAgeSec * 1000) {
-      remote = { ...cache.remote, fetchedAt: new Date(cache.fetchedAt).toISOString(), cached: true };
+      remote = {
+        ...annotateAccountSummary(cache.remote, { now, expiringSoonDays }),
+        fetchedAt: new Date(cache.fetchedAt).toISOString(),
+        cached: true,
+      };
     } else if (!tok) {
       throw new Error(`no access token: set CODEBUDDY_USAGE_TOKEN or run \`codebuddy-usage set-token\` (file ${cbConfig.tokenFile})`);
     } else {
-      const r = await fetchRemote({ token: tok.token, fetchImpl });
+      const r = await fetchRemote({ token: tok.token, fetchImpl, now, expiringSoonDays });
       mkdirSync(dirname(cbConfig.cacheFile), { recursive: true });
       writeFileSync(cbConfig.cacheFile, JSON.stringify({ fetchedAt: now, remote: r }));
       remote = { ...r, fetchedAt: new Date(now).toISOString(), cached: false };
     }
   } catch (e) {
-    remote = { error: e.message, last: cache?.remote ? { ...cache.remote, fetchedAt: new Date(cache.fetchedAt).toISOString() } : null };
+    remote = {
+      error: e.message,
+      last: cache?.remote
+        ? { ...annotateAccountSummary(cache.remote, { now, expiringSoonDays }), fetchedAt: new Date(cache.fetchedAt).toISOString() }
+        : null,
+    };
   }
-  return { remote, token: tokenInfo, local: { sinceDays, ...local } };
+  const localWithWindow = { sinceDays, ...local };
+  const runway = computeRunway(remote, localWithWindow, { sinceDays });
+  return { remote, token: tokenInfo, local: localWithWindow, runway };
 }
