@@ -94,10 +94,23 @@ export class Cdp {
       if (r.width <= 0 || r.height <= 0) return null;
       const x = r.x + r.width / 2, y = r.y + r.height / 2;
       const hit = document.elementFromPoint(x, y);
-      return { x, y, blocked: !hit || (hit !== e && !e.contains(hit)) };
+      const blocked = !hit || (hit !== e && !e.contains(hit));
+      const blocker = blocked && hit ? {
+        tag: (hit.tagName || '').toLowerCase(),
+        role: hit.getAttribute?.('role') || null,
+        testId: hit.getAttribute?.('data-testid') || null,
+        text: (hit.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 80) || null,
+      } : null;
+      return { x, y, blocked, blocker };
     })()`);
     if (!pt) throw new Error(`UI element not found or not visible: ${what ?? elementExpr}`);
-    if (pt.blocked) throw new Error(`UI element is blocked by another element: ${what ?? elementExpr}. Check for an open dialog or overlay.`);
+    if (pt.blocked) {
+      const b = pt.blocker;
+      const detail = b
+        ? ` (${b.tag}${b.role ? `[role=${b.role}]` : ""}${b.testId ? `[data-testid=${b.testId}]` : ""}${b.text ? ` "${b.text}"` : ""})`
+        : "";
+      throw new Error(`UI element is blocked by another element: ${what ?? elementExpr}${detail}. Check for an open dialog or overlay.`);
+    }
     await this.#clickAt(pt);
   }
 

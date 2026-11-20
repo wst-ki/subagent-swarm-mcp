@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
-import { setMode } from "../src/zcode.mjs";
+import { closeOpenMenu, setMode, setModel } from "../src/zcode.mjs";
 
 function makeFakeCdp({ initialMode = "变更前确认", withDialog = false, stayDisabled = false } = {}) {
   let mode = initialMode;
@@ -81,4 +81,151 @@ test("setMode cancels yolo-confirmation-dialog and throws if confirm stays disab
     "yolo-confirmation-risk",
     "yolo-confirmation-cancel",
   ]);
+});
+
+function makeMenuCdp({
+  dialogs = [],
+  menuDepth = 0,
+  popperStuckOnEscape = false,
+  modelItems = [],
+  onSelectModel = null,
+} = {}) {
+  let depth = menuDepth;
+  let popperOpen = popperStuckOnEscape;
+  let escapes = 0;
+  const mouseEvents = [];
+  const clicks = [];
+  let items = modelItems;
+
+  const visibleEl = (extra = {}) => ({
+    getBoundingClientRect: () => ({ width: 100, height: 30 }),
+    getAttribute: (k) => extra[k] ?? null,
+    innerText: extra.text ?? "",
+    querySelector: () => null,
+  });
+
+  return {
+    clicks,
+    mouseEvents,
+    get escapes() {
+      return escapes;
+    },
+    get isMenuOpen() {
+      return depth > 0 || popperOpen;
+    },
+    setItems(next) {
+      items = next;
+    },
+    async pressEscape() {
+      escapes++;
+      if (depth > 0) depth--;
+    },
+    async call(method, params) {
+      if (method === "Input.dispatchMouseEvent") {
+        mouseEvents.push(params);
+        if (params.type === "mouseReleased" && params.x === 1 && params.y === 1) {
+          popperOpen = false;
+        }
+      }
+      return {};
+    },
+    async clickTestId(id) {
+      clicks.push(id);
+      if (id === "chat-model-select-trigger") {
+        depth = 1;
+      }
+    },
+    async clickElement(_expr, what) {
+      clicks.push(what);
+      if (onSelectModel) {
+        await onSelectModel(what, { setItems: (n) => (items = n), setDepth: (d) => (depth = d) });
+      } else {
+        depth = 0;
+      }
+    },
+    async evaluate(expression) {
+      const qsa = (selector) => {
+        if (selector.includes("alertdialog")) return dialogs.map((d) => visibleEl({ text: d }));
+        if (selector.includes("[role=menu],[role=listbox]")) return depth > 0 ? [visibleEl({ role: "menu" })] : [];
+        if (selector.includes("data-radix-popper-content-wrapper")) return popperOpen ? [visibleEl()] : [];
+        if (selector.includes("menuitemradio")) {
+          if (depth === 0) return [];
+          return items.map((i) =>
+            visibleEl({
+              "data-testid": i.testId,
+              role: i.role ?? "menuitemradio",
+              "aria-checked": String(Boolean(i.checked)),
+              text: i.text ?? "",
+            }),
+          );
+        }
+        return [];
+      };
+      return runInNewContext(expression, {
+        document: {
+          querySelector: () => null,
+          querySelectorAll: qsa,
+          body: { style: { pointerEvents: popperOpen ? "none" : "" } },
+        },
+      });
+    },
+  };
+}
+
+test("closeOpenMenu: no-op when clean, refuses on real dialogs, unwinds nested submenus and stubborn popovers", async () => {
+  // Clean screen -> 0 escapes
+  const clean = makeMenuCdp({ menuDepth: 0 });
+  assert.equal(await closeOpenMenu(clean, { delayMs: 1 }), true);
+  assert.equal(clean.escapes, 0);
+
+  // Real dialog open -> MUST NOT touch it (0 escapes, 0 mouse events)
+  const withDialog = makeMenuCdp({ dialogs: ["登录已过期"], menuDepth: 1 });
+  assert.equal(await closeOpenMenu(withDialog, { delayMs: 1 }), false);
+  assert.equal(withDialog.escapes, 0);
+  assert.equal(withDialog.mouseEvents.length, 0);
+
+  // Nested 2-level Radix submenu -> sends 2 escapes and clears cleanly
+  const nested = makeMenuCdp({ menuDepth: 2 });
+  assert.equal(await closeOpenMenu(nested, { delayMs: 1 }), true);
+  assert.equal(nested.escapes, 2);
+  assert.equal(nested.isMenuOpen, false);
+
+  // Unfocused Radix popper that ignores Escape -> falls back to neutral (1,1) corner click
+  const stubborn = makeMenuCdp({ menuDepth: 0, popperStuckOnEscape: true });
+  assert.equal(await closeOpenMenu(stubborn, { delayMs: 1 }), true);
+  assert.equal(stubborn.isMenuOpen, false);
+  assert.ok(stubborn.mouseEvents.some((e) => e.type === "mouseReleased" && e.x === 1 && e.y === 1));
+});
+
+test("setModel skips redundant double-open when already selected and cleans up menu on failure", async () => {
+  const wantedId = "chat-model-select-item-custom:account%3Abigmodel-individual-coding-plan:GLM-5.3-Flash";
+  const already = makeMenuCdp({
+    modelItems: [{ testId: wantedId, checked: true, text: "GLM-5.3-Flash" }],
+  });
+  const plan = await setModel(already, "GLM-5.3-Flash", "account%3Abigmodel-individual-coding-plan", {
+    allowedProviders: ["account%3Abigmodel-individual-coding-plan"],
+    stepDelayMs: 1,
+  });
+  assert.equal(plan.status, "already-selected");
+  // Opened ONCE and closed cleanly (never re-opened for redundant verifyModel!)
+  assert.deepEqual(already.clicks, ["chat-model-select-trigger"]);
+  assert.equal(already.isMenuOpen, false);
+
+  // Failed switch MUST close the open menu in finally so later clicks are never blocked!
+  const failing = makeMenuCdp({
+    modelItems: [{ testId: wantedId, checked: false, text: "GLM-5.3-Flash" }],
+    onSelectModel: async (_what, { setDepth }) => {
+      // Simulate ZCode ignoring the click while leaving the menu open
+      setDepth(1);
+    },
+  });
+  await assert.rejects(
+    setModel(failing, "GLM-5.3-Flash", "account%3Abigmodel-individual-coding-plan", {
+      allowedProviders: ["account%3Abigmodel-individual-coding-plan"],
+      verifyTimeout: 300,
+      stepDelayMs: 1,
+    }),
+    /ZCode did not switch to model GLM-5\.3-Flash/,
+  );
+  assert.equal(failing.isMenuOpen, false);
 });

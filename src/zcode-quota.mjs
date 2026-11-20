@@ -3,7 +3,7 @@
 import { Cdp, sleep } from "./cdp.mjs";
 import { config } from "./config.mjs";
 import { withUiLock } from "./lock.mjs";
-import { uiBlocker } from "./zcode.mjs";
+import { OPEN_POPOVER_EXPR, closeOpenMenu, uiBlocker } from "./zcode.mjs";
 
 const names = new Map([["5 小时", "five_hour"], ["5小时", "five_hour"], ["每周", "weekly"], ["周额度", "weekly"], ["工具调用", "tool_calls"], ["ZCode MCP", "zcode_mcp"]]);
 
@@ -29,21 +29,21 @@ export function parseQuotaPanel(text) {
 
 const readPanel = `(() => { const e = [...document.querySelectorAll('[data-radix-popper-content-wrapper]')].find(e => { const r=e.getBoundingClientRect(); return r.width>0 && r.height>0 && !e.querySelector('[data-context-reset-reminder]') && e.innerText.includes('剩余额度'); }); return e?.innerText ?? null; })()`;
 
-export const hasBlockingPopoverExpr = `(() => {
-  const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-  if ([...document.querySelectorAll('[role=menu],[role=listbox]')].some(visible)) return true;
-  return [...document.querySelectorAll('[data-radix-popper-content-wrapper]')].some(e => visible(e) && !e.querySelector('[data-context-reset-reminder]'));
-})()`;
+export const hasBlockingPopoverExpr = OPEN_POPOVER_EXPR;
 
-export async function zcodeQuota() {
+export async function zcodeQuota({ autoDismissPopover = process.env.ZCODE_MCP_AUTO_DISMISS_POPOVER !== "0" } = {}) {
   return withUiLock(async () => {
     const cdp = await Cdp.connect(config.cdpPort);
     let opened = false;
     try {
       const blocker = await uiBlocker(cdp);
       if (blocker) throw new Error(blocker.message);
-      if (await cdp.evaluate(hasBlockingPopoverExpr))
-        throw new Error("A menu or popover is already open; quota read refused to avoid changing it.");
+      if (await cdp.evaluate(hasBlockingPopoverExpr)) {
+        const cleared = autoDismissPopover ? await closeOpenMenu(cdp) : false;
+        if (!cleared) {
+          throw new Error("A menu or popover is already open; quota read refused to avoid changing it.");
+        }
+      }
       // This is a hover card: create a fresh pointer-enter even if a prior read left the pointer on it.
       await cdp.call("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1, button: "none" });
       await sleep(300);
@@ -64,7 +64,13 @@ export async function zcodeQuota() {
       };
     } finally {
       if (opened) {
-        try { if (await cdp.evaluate(readPanel)) await cdp.call("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1, button: "none" }); } catch { /* leave the UI alone if it changed */ }
+        try {
+          if (await cdp.evaluate(readPanel)) {
+            await cdp.call("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1, button: "none" });
+            await sleep(150);
+          }
+          await closeOpenMenu(cdp).catch(() => {});
+        } catch { /* leave the UI alone if it changed */ }
       }
       cdp.close();
     }

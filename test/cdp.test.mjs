@@ -4,11 +4,19 @@ import { runInNewContext } from "node:vm";
 import { Cdp } from "../src/cdp.mjs";
 import { uiBlocker } from "../src/zcode.mjs";
 
-test("blocked element never dispatches a pointer event", async () => {
+test("blocked element never dispatches a pointer event and reports blocker details", async () => {
   const cdp = new Cdp();
-  cdp.evaluate = async () => ({ x: 4, y: 5, blocked: true });
+  cdp.evaluate = async () => ({
+    x: 4,
+    y: 5,
+    blocked: true,
+    blocker: { tag: "div", role: "menu", testId: "model-menu", text: "GLM-5.3" },
+  });
   cdp.call = async () => assert.fail("pointer event dispatched through overlay");
-  await assert.rejects(cdp.clickElement("target", "target"), /blocked by another element/);
+  await assert.rejects(
+    cdp.clickElement("target", "target"),
+    /blocked by another element: target \(div\[role=menu\]\[data-testid=model-menu\] "GLM-5\.3"\)/,
+  );
 });
 
 test("authentication and other dialogs are reported without interaction", async () => {

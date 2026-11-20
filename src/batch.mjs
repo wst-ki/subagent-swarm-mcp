@@ -113,6 +113,12 @@ export function classifyBlocker(code, message = '') {
       if (/quota|rate.limit|429|额度|限流/i.test(String(message ?? ''))) {
         return { retryable: true, recommendedAction: 'cooldown_quota' };
       }
+      if (/blocked by another element|open dialog or overlay|menu or popover|popover stayed open/i.test(String(message ?? ''))) {
+        return { retryable: true, recommendedAction: 'dismiss_ui_overlay' };
+      }
+      if (/switch to model|billing route|ZCODE_MCP_PROVIDERS|provider.*not enabled/i.test(String(message ?? ''))) {
+        return { retryable: false, recommendedAction: 'check_billing_route' };
+      }
       return { retryable: false, recommendedAction: 'needs_human_auth' };
     default:
       return { retryable: false, recommendedAction: 'inspect_error' };

@@ -464,6 +464,14 @@ test("batch reserveSlots yields dynamically when other tasks occupy slots and cl
     retryable: true,
     recommendedAction: "cooldown_quota",
   });
+  assert.deepEqual(
+    classifyBlocker("submission_circuit_breaker", 'UI element is blocked by another element: "new task" button. Check for an open dialog or overlay.'),
+    { retryable: true, recommendedAction: "dismiss_ui_overlay" },
+  );
+  assert.deepEqual(
+    classifyBlocker("submission_circuit_breaker", "ZCode did not switch to model GLM-5.3-Flash on provider account:bigmodel-individual-coding-plan"),
+    { retryable: false, recommendedAction: "check_billing_route" },
+  );
 
   const stateDir = makeTempDir("reserve-slots-");
   try {

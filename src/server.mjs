@@ -30,7 +30,7 @@ import {
   swarmWait,
 } from "./backends/registry.mjs";
 
-const server = new McpServer({ name: "subagent-swarm-mcp", version: "0.3.1" });
+const server = new McpServer({ name: "subagent-swarm-mcp", version: "0.3.2" });
 
 const ok = (obj) => ({ content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: `Error: ${e?.message ?? e}` }] });

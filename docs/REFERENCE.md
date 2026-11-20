@@ -107,7 +107,7 @@ ZCode's model menu groups the same model names under multiple billing routes, so
 | `account%3Abigmodel-individual-coding-plan` (default) | BigModel 个人 | `GLM-5.3`, `GLM-5.3-Flash` |
 | `account%3Abigmodel-start-plan` | Start Plan 免费 | `GLM-5.3`, `GLM-5.3-Flash` |
 
-`ZCODE_MCP_PROVIDER` sets the default route and `ZCODE_MCP_PROVIDERS` defines the allow-list (requests outside the allow-list are rejected so personal API-key routes are never chosen accidentally). Because the trigger's `aria-label` displays only the model name, `setModel` opens the menu, switches providers via `composer-provider-trigger` when needed, picks `chat-model-select-item-custom:<providerKey>:<model>`, re-opens the menu to verify `aria-checked`, and compares SQLite `model.providerId` after creation (attaching a `warning` on mismatch).
+`ZCODE_MCP_PROVIDER` sets the default route and `ZCODE_MCP_PROVIDERS` defines the allow-list (requests outside the allow-list are rejected so personal API-key routes are never chosen accidentally). Because the trigger's `aria-label` displays only the model name, `setModel` opens the menu and waits dynamically for items to render, exits immediately in a single pass when the desired `(provider, model)` is already checked (eliminating redundant menu double-opens), switches providers via `composer-provider-trigger` when needed, verifies `aria-checked`, always closes menus in `finally` (unwinding nested Radix submenus and stray non-dialog popovers without ever touching real auth/confirmation dialogs), and compares SQLite `model.providerId` after creation (attaching a `warning` on mismatch).
 
 ---
 
@@ -185,6 +185,7 @@ All binaries are exposed via `package.json` `bin` (or `node bin/<name>.mjs`):
 | `ZCODE_MCP_PROVIDER` | `account%3Abigmodel-individual-coding-plan` | Default ZCode billing route |
 | `ZCODE_MCP_PROVIDERS` | `account%3Abigmodel-individual-coding-plan,account%3Abigmodel-start-plan` | Allowed ZCode billing routes; all others refused |
 | `ZCODE_MCP_MAX_RUNNING` | `3` | Concurrent running ZCode task cap |
+| `ZCODE_MCP_AUTO_DISMISS_POPOVER` | `1` (enabled) | Allow `zcode_quota` to dismiss stale non-dialog Radix popovers before reading (`0` refuses instead; real dialogs are never touched) |
 | `ZCODE_MCP_STALLED_SEC` | `600` | Idle seconds before reporting a stalled task |
 | `ZCODE_MCP_STARTING_TIMEOUT_SEC` | `300` | Seconds before an unstarted session fails closed |
 | `ZCODE_MCP_LOCAL_MODULE` | unset (`local/presets.mjs`) | Optional extension path, or `none` to disable |
