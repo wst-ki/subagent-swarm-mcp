@@ -1,6 +1,6 @@
 {
   "name": "subagent-swarm-mcp",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Multi-CLI MCP server and structured microbatch toolkit (CodeBuddy CLI, Qoder CLI, ZCode desktop app, extensible backends) for delegating subtasks across coding CLI subscriptions",
   "type": "module",
   "bin": {

@@ -39,7 +39,7 @@ Detailed specification for **subagent-swarm-mcp** (legacy bin `glm-zcode-mcp`) M
 | `zcode_health {}` | Check DevTools port, target project visibility, running count, and known login/dialog blockers. |
 | `zcode_quota {}` | Briefly open the UI context hover card under the UI lock and parse displayed quota windows. |
 
-> **`zcode_quota` caveats:** Returns the local observation time and display reset text as rendered by ZCode, not a verified server refresh timestamp. Missing or unrecognized windows report as unknown (never zero). Displayed account/provider identity cannot be independently verified, so do not use it as an automated billing-route gate. It never clicks reset actions or handles credentials.
+> **`zcode_quota` caveats:** Holds the hovercard open for a brief settle window (`ZCODE_MCP_QUOTA_SETTLE_MS`, default `1200` ms, converging early once an async UI update stabilizes) so ZCode's background entitlement refresh completes instead of returning the previous open's cached percentage (`refreshedDuringRead` indicates whether the DOM updated during the wait). Missing or unrecognized windows report as unknown (never zero). Displayed account/provider identity cannot be independently verified, so do not use it as an automated billing-route gate. It never clicks reset actions or handles credentials.
 
 ### Legacy ZCode Session Snapshots, Events & Model IO (4)
 
@@ -186,6 +186,7 @@ All binaries are exposed via `package.json` `bin` (or `node bin/<name>.mjs`):
 | `ZCODE_MCP_PROVIDERS` | `account%3Abigmodel-individual-coding-plan,account%3Abigmodel-start-plan` | Allowed ZCode billing routes; all others refused |
 | `ZCODE_MCP_MAX_RUNNING` | `3` | Concurrent running ZCode task cap |
 | `ZCODE_MCP_AUTO_DISMISS_POPOVER` | `1` (enabled) | Allow `zcode_quota` to dismiss stale non-dialog Radix popovers before reading (`0` refuses instead; real dialogs are never touched) |
+| `ZCODE_MCP_QUOTA_SETTLE_MS` | `1200` | Milliseconds `zcode_quota` holds the hovercard open for ZCode's async entitlement refresh before reading (`0..5000`; converges early on update) |
 | `ZCODE_MCP_STALLED_SEC` | `600` | Idle seconds before reporting a stalled task |
 | `ZCODE_MCP_STARTING_TIMEOUT_SEC` | `300` | Seconds before an unstarted session fails closed |
 | `ZCODE_MCP_LOCAL_MODULE` | unset (`local/presets.mjs`) | Optional extension path, or `none` to disable |
