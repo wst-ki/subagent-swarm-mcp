@@ -30,7 +30,7 @@ import {
   swarmWait,
 } from "./backends/registry.mjs";
 
-const server = new McpServer({ name: "subagent-swarm-mcp", version: "0.3.3" });
+const server = new McpServer({ name: "subagent-swarm-mcp", version: "0.3.4" });
 
 const ok = (obj) => ({ content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] });
 const fail = (e) => ({ isError: true, content: [{ type: "text", text: `Error: ${e?.message ?? e}` }] });
@@ -86,6 +86,7 @@ server.registerTool(
       maxBatchInputChars: z.number().int().min(1000).max(60000).optional(),
       model: model.optional(),
       provider: z.string().optional(),
+      fallbackProvider: z.string().optional().describe("Allow-listed ZCode billing route to switch to automatically if primary provider hits quota/rate-limit."),
       maxConcurrency: z.number().int().min(1).max(config.maxRunning).optional(),
       reserveSlots: z.number().int().min(0).max(Math.max(0, config.maxRunning - 1)).optional(),
       maxRetries: z.number().int().min(0).max(1).optional(),
@@ -819,6 +820,7 @@ server.registerTool(
       ephemeral: z.boolean().optional(),
       model: swarmModel.optional(),
       provider: z.string().optional(),
+      fallbackProvider: z.string().optional().describe("Allow-listed ZCode billing route to fail over to automatically on quota/rate-limit."),
       maxConcurrency: z.number().int().min(1).max(8).optional(),
       reserveSlots: z.number().int().min(0).max(7).optional(),
       maxCredit: z.number().positive().optional(),

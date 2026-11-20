@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseQuotaPanel, readSettledQuotaPanel } from "../src/zcode-quota.mjs";
+import { detectQuotaSection, parseQuotaPanel, readSettledQuotaPanel } from "../src/zcode-quota.mjs";
 
 test("quota parser distinguishes context, quota windows and reset display", () => {
   const panel = "上下文容量\n3.3万/100万 (3.3%)\n剩余额度\n获得4次重置额度\n5 小时\n重置\n52% · 01:15\n工具调用\n95% · 11月17日\nZCode MCP\n100% · 11月6日";
@@ -105,4 +105,47 @@ test("readSettledQuotaPanel preserves last valid reading if hovercard closes mid
   assert.equal(res.windows.length, 1);
   assert.equal(res.windows[0].remainingPercent, 75);
   assert.equal(res.settleWaitMs, 150);
+});
+
+test("parseQuotaPanel and readSettledQuotaPanel parse Start Plan 今日余额 hovercard and skip promo badges", async () => {
+  const startPlanPanel = [
+    "上下文容量",
+    "3万/100万 (3%)",
+    "系统工具",
+    "55.2%",
+    "今日余额",
+    "升级",
+    "150% 配额",
+    "GLM-5.3-Flash",
+    "100% · 11月23日",
+  ].join("\n");
+
+  const sec = detectQuotaSection(startPlanPanel);
+  assert.equal(sec.section, "今日余额");
+  assert.equal(sec.planHint, "start_plan");
+
+  assert.deepEqual(parseQuotaPanel(startPlanPanel), [
+    {
+      kind: "model_daily",
+      label: "GLM-5.3-Flash",
+      model: "GLM-5.3-Flash",
+      remainingPercent: 100,
+      resetDisplay: "11月23日",
+    },
+  ]);
+
+  let clock = 0;
+  const sleeper = async (ms) => {
+    clock += ms;
+  };
+  const updatedPanel = startPlanPanel.replace("100% · 11月23日", "84% · 11月23日");
+  const res = await readSettledQuotaPanel(
+    async () => (clock < 400 ? startPlanPanel : updatedPanel),
+    { appearTimeoutMs: 3000, settleMs: 1200, pollMs: 150, postChangeStabilizeMs: 150, sleeper, nowFn: () => clock },
+  );
+  assert.equal(res.section, "今日余额");
+  assert.equal(res.planHint, "start_plan");
+  assert.equal(res.refreshedDuringRead, true);
+  assert.equal(res.windows[0].model, "GLM-5.3-Flash");
+  assert.equal(res.windows[0].remainingPercent, 84);
 });

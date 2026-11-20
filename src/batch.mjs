@@ -305,6 +305,7 @@ export async function runStructuredBatch({
   addDirs = undefined,
   model,
   provider,
+  fallbackProvider = undefined,
   maxConcurrency = 1,
   reserveSlots = 0,
   maxCredit = null,
@@ -375,6 +376,14 @@ export async function runStructuredBatch({
   const route = resolvedBackend === 'zcode'
     ? resolveProvider(provider ?? config.providerKey, config.allowedProviders)
     : null;
+  const resolvedFallbackRoute = resolvedBackend === 'zcode' && fallbackProvider
+    ? resolveProvider(fallbackProvider, config.allowedProviders)
+    : null;
+  const fallbackRoute = resolvedFallbackRoute && route && resolvedFallbackRoute.encoded !== route.encoded
+    ? resolvedFallbackRoute
+    : null;
+  let activeRoute = route;
+  let fallbackTriggered = null;
   const dir = resolveBatchDir(batchId, stateDir);
   mkdirSync(dir, { recursive: true });
 
@@ -417,10 +426,10 @@ export async function runStructuredBatch({
     });
   });
 
-  const buildRunPayload = (base) => ({
+  const buildRunPayload = (base, targetRoute = activeRoute) => ({
     ...base,
     model,
-    ...(route ? { provider: route.encoded } : {}),
+    ...(targetRoute ? { provider: targetRoute.encoded } : {}),
     ...(resolvedBackend !== 'zcode'
       ? {
           backend: resolvedBackend,
@@ -436,6 +445,23 @@ export async function runStructuredBatch({
         }
       : {}),
   });
+
+  const tryActivateFallbackProvider = (submittedRoute, reason, detail = {}) => {
+    if (!fallbackRoute || !submittedRoute) return false;
+    if (submittedRoute.encoded === fallbackRoute.encoded) return false;
+    if (!fallbackTriggered) {
+      activeRoute = fallbackRoute;
+      fallbackTriggered = {
+        from: submittedRoute.decoded,
+        to: fallbackRoute.decoded,
+        reason,
+        at: new Date().toISOString(),
+        ...detail,
+      };
+      writeProgress('running');
+    }
+    return true;
+  };
 
   const cpuStart = process.cpuUsage();
   const wallStart = Date.now();
@@ -486,6 +512,8 @@ export async function runStructuredBatch({
       effectiveConcurrency,
       reserveSlots,
       ...(maxCredit != null ? { maxCredit } : {}),
+      ...(activeRoute ? { activeProvider: activeRoute.decoded } : {}),
+      ...(fallbackTriggered ? { providerFallback: fallbackTriggered } : {}),
       startedAt: new Date(wallStart).toISOString(),
       updatedAt: new Date().toISOString(),
     });
@@ -610,6 +638,7 @@ export async function runStructuredBatch({
   async function processSingleItem(normItem) {
     let startAttempt = normItem.startAttempt ?? 1;
     let lastErrors = normItem.lastErrors ?? null;
+    let didProviderFallback = false;
 
     for (let attempt = startAttempt; attempt <= maxRetries + 1; attempt++) {
       if (blockedReason) return;
@@ -618,6 +647,7 @@ export async function runStructuredBatch({
         : task;
 
       const t0 = Date.now();
+      const submittedRoute = activeRoute;
       let started;
       try {
         started = await submitWithCapacityWait(buildRunPayload({
@@ -625,11 +655,22 @@ export async function runStructuredBatch({
           input: normItem.input,
           schema,
           domainRule: domainRule ?? undefined,
-        }));
+        }, submittedRoute));
       } catch (err) {
         if (err?.abortedByBlocker) return;
         const msg = String(err?.message ?? err);
         const isCapacityExhausted = Boolean(err?.capacityExhausted);
+        const isQuotaOrRouteUnavailable =
+          !isCapacityExhausted && /quota|rate.limit|429|credit|insufficient|额度|限流|does not offer model/i.test(msg);
+        if (
+          isQuotaOrRouteUnavailable &&
+          !didProviderFallback &&
+          tryActivateFallbackProvider(submittedRoute, msg, { itemId: normItem.itemId })
+        ) {
+          didProviderFallback = true;
+          attempt--;
+          continue;
+        }
         const isAuthOrBlocker = !isCapacityExhausted && /login|expired|sign in|dialog|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
         const failureKind = isCapacityExhausted ? 'capacity_exhausted' : isAuthOrBlocker ? 'circuit_breaker' : 'submission_error';
         const rec = {
@@ -702,8 +743,8 @@ export async function runStructuredBatch({
         return;
       }
 
-      if (route && evalRes.model?.providerId && normalizeProviderKey(evalRes.model.providerId).encoded !== route.encoded) {
-        const msg = `Session ${started.taskId} recorded providerId "${evalRes.model.providerId}" instead of "${route.decoded}"`;
+      if (submittedRoute && evalRes.model?.providerId && normalizeProviderKey(evalRes.model.providerId).encoded !== submittedRoute.encoded) {
+        const msg = `Session ${started.taskId} recorded providerId "${evalRes.model.providerId}" instead of "${submittedRoute.decoded}"`;
         const rec = {
           itemId: normItem.itemId,
           itemKey: normItem.itemKey,
@@ -743,6 +784,17 @@ export async function runStructuredBatch({
       writeProgress('running');
 
       if (evalRes.failureKind === 'quota_or_rate_limit') {
+        if (
+          !didProviderFallback &&
+          tryActivateFallbackProvider(submittedRoute, `Task ${started.taskId} hit quota or rate limit`, {
+            itemId: normItem.itemId,
+            taskId: started.taskId,
+          })
+        ) {
+          didProviderFallback = true;
+          attempt--;
+          continue;
+        }
         stopWithBlocker('quota_or_rate_limit', `Task ${started.taskId} hit quota or rate limit`, {
           itemId: normItem.itemId,
           taskId: started.taskId,
@@ -770,6 +822,7 @@ export async function runStructuredBatch({
 
     let remaining = [...chunkItems];
     let lastBatchErrors = [];
+    let didProviderFallback = false;
 
     for (let attempt = 1; attempt <= maxRetries + 1 && remaining.length > 0; attempt++) {
       if (blockedReason) return;
@@ -793,17 +846,29 @@ export async function runStructuredBatch({
       ].join('\n');
 
       const t0 = Date.now();
+      const submittedRoute = activeRoute;
       let started;
       try {
         started = await submitWithCapacityWait(buildRunPayload({
           task: mbTask,
           input: mbInput,
           schema: mbSchema,
-        }));
+        }, submittedRoute));
       } catch (err) {
         if (err?.abortedByBlocker) return;
         const msg = String(err?.message ?? err);
         const isCapacityExhausted = Boolean(err?.capacityExhausted);
+        const isQuotaOrRouteUnavailable =
+          !isCapacityExhausted && /quota|rate.limit|429|credit|insufficient|额度|限流|does not offer model/i.test(msg);
+        if (
+          isQuotaOrRouteUnavailable &&
+          !didProviderFallback &&
+          tryActivateFallbackProvider(submittedRoute, msg, { itemId: remaining[0].itemId })
+        ) {
+          didProviderFallback = true;
+          attempt--;
+          continue;
+        }
         const isAuthOrBlocker = !isCapacityExhausted && /login|expired|sign in|dialog|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
         const failureKind = isCapacityExhausted ? 'capacity_exhausted' : isAuthOrBlocker ? 'circuit_breaker' : 'submission_error';
         for (const it of remaining) {
@@ -883,8 +948,8 @@ export async function runStructuredBatch({
         return;
       }
 
-      if (route && evalRes.model?.providerId && normalizeProviderKey(evalRes.model.providerId).encoded !== route.encoded) {
-        const msg = `Session ${started.taskId} recorded providerId "${evalRes.model.providerId}" instead of "${route.decoded}"`;
+      if (submittedRoute && evalRes.model?.providerId && normalizeProviderKey(evalRes.model.providerId).encoded !== submittedRoute.encoded) {
+        const msg = `Session ${started.taskId} recorded providerId "${evalRes.model.providerId}" instead of "${submittedRoute.decoded}"`;
         for (const it of remaining) {
           const rec = {
             itemId: it.itemId,
@@ -907,6 +972,17 @@ export async function runStructuredBatch({
       }
 
       if (evalRes.failureKind === 'quota_or_rate_limit') {
+        if (
+          !didProviderFallback &&
+          tryActivateFallbackProvider(submittedRoute, `Task ${started.taskId} hit quota or rate limit`, {
+            itemId: remaining[0].itemId,
+            taskId: started.taskId,
+          })
+        ) {
+          didProviderFallback = true;
+          attempt--;
+          continue;
+        }
         for (const it of remaining) {
           const rec = {
             itemId: it.itemId,
@@ -1025,6 +1101,9 @@ export async function runStructuredBatch({
     effectiveConcurrency,
     reserveSlots,
     ...(maxCredit != null ? { maxCredit } : {}),
+    ...(route ? { provider: route.decoded, activeProvider: activeRoute?.decoded ?? route.decoded } : {}),
+    ...(fallbackRoute ? { fallbackProvider: fallbackRoute.decoded } : {}),
+    ...(fallbackTriggered ? { providerFallback: fallbackTriggered } : {}),
     metrics: {
       wallMs,
       cpuUserMs: Number((cpuDelta.user / 1000).toFixed(2)),

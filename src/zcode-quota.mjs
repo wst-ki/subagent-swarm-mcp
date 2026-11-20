@@ -1,38 +1,74 @@
 // On-demand reading of the official UI's displayed quota, not the context meter.
+// Supports both BigModel Individual Coding Plan ("剩余额度") and Start Plan ("今日余额") panels.
 // Never touches credentials, calls an upstream endpoint, or invokes reset actions.
 import { Cdp, sleep } from "./cdp.mjs";
 import { config } from "./config.mjs";
 import { withUiLock } from "./lock.mjs";
 import { OPEN_POPOVER_EXPR, closeOpenMenu, uiBlocker } from "./zcode.mjs";
 
-const names = new Map([["5 小时", "five_hour"], ["5小时", "five_hour"], ["每周", "weekly"], ["周额度", "weekly"], ["工具调用", "tool_calls"], ["ZCode MCP", "zcode_mcp"]]);
+const names = new Map([
+  ["5 小时", "five_hour"],
+  ["5小时", "five_hour"],
+  ["每周", "weekly"],
+  ["周额度", "weekly"],
+  ["工具调用", "tool_calls"],
+  ["ZCode MCP", "zcode_mcp"],
+]);
+
+const SECTION_HEADERS = [
+  { label: "剩余额度", planHint: "individual_coding_plan" },
+  { label: "今日余额", planHint: "start_plan" },
+];
+
+const MODEL_LABEL_RE = /^[A-Za-z][A-Za-z0-9._-]{1,40}$/;
+
+export function detectQuotaSection(text) {
+  const lines = String(text ?? "").split(/\n/).map((s) => s.trim()).filter(Boolean);
+  for (const h of SECTION_HEADERS) {
+    const index = lines.indexOf(h.label);
+    if (index >= 0) return { section: h.label, planHint: h.planHint, index, lines };
+  }
+  return { section: null, planHint: null, index: -1, lines };
+}
 
 export function parseQuotaPanel(text) {
-  const lines = String(text).split(/\n/).map(s => s.trim()).filter(Boolean);
-  const start = lines.indexOf("剩余额度");
+  const { section, index: start, lines } = detectQuotaSection(text);
   if (start < 0) return [];
+  const allowModelLabels = section === "今日余额";
   const windows = [];
+  const seenKeys = new Set();
   let current = null;
   for (const line of lines.slice(start + 1)) {
     const kind = names.get(line);
-    if (kind) { current = { kind, label: line }; continue; }
+    if (kind) {
+      current = { kind, label: line };
+      continue;
+    }
+    if (allowModelLabels && MODEL_LABEL_RE.test(line)) {
+      current = { kind: "model_daily", label: line, model: line };
+      continue;
+    }
     if (!current) continue;
     const m = line.match(/^(\d+(?:\.\d+)?)%\s*(?:[·•]\s*(.+))?$/);
     if (!m) continue;
     const pct = Number(m[1]);
-    if (pct >= 0 && pct <= 100 && !windows.some(w => w.kind === current.kind))
+    const key = current.kind === "model_daily" ? `${current.kind}:${current.model}` : current.kind;
+    if (pct >= 0 && pct <= 100 && !seenKeys.has(key)) {
+      seenKeys.add(key);
       windows.push({ ...current, remainingPercent: pct, resetDisplay: m[2] ?? null });
+    }
     current = null;
   }
   return windows;
 }
 
 const windowsSignature = (windows) =>
-  windows.map((w) => `${w.kind}:${w.remainingPercent}:${w.resetDisplay ?? ""}`).join("|");
+  windows.map((w) => `${w.kind}:${w.model ?? ""}:${w.remainingPercent}:${w.resetDisplay ?? ""}`).join("|");
 
 /**
  * Poll the open quota hovercard until it renders valid windows and then wait for ZCode's async
  * entitlement refresh (`getEntitlementSnapshot`, typically ~250-350 ms) to settle.
+ * - Supports both "剩余额度" (Individual Coding Plan) and "今日余额" (Start Plan) hovercards.
  * - Avoids the 1-call-lagged stale-cache bug where opening the popover immediately paints the
  *   previous reading before the async RPC updates the DOM.
  * - Converges early once a live DOM update is observed and stabilizes for one extra poll.
@@ -53,6 +89,7 @@ export async function readSettledQuotaPanel(
   let initialSig = null;
   let latestSig = null;
   let latestWindows = [];
+  let latestSection = { section: null, planHint: null };
   let appearedAt = null;
   let changedAt = null;
 
@@ -63,7 +100,9 @@ export async function readSettledQuotaPanel(
     if (!text) continue;
     const parsed = parseQuotaPanel(text);
     if (parsed.length > 0) {
+      const sec = detectQuotaSection(text);
       latestWindows = parsed;
+      latestSection = { section: sec.section, planHint: sec.planHint };
       initialSig = windowsSignature(parsed);
       latestSig = initialSig;
       appearedAt = nowFn();
@@ -74,6 +113,8 @@ export async function readSettledQuotaPanel(
   if (appearedAt === null || settleMs <= 0) {
     return {
       windows: latestWindows,
+      section: latestSection.section,
+      planHint: latestSection.planHint,
       refreshedDuringRead: false,
       settleWaitMs: 0,
     };
@@ -87,8 +128,10 @@ export async function readSettledQuotaPanel(
     if (!text) break; // Panel closed unexpectedly; keep best valid reading instead of burning time.
     const parsed = parseQuotaPanel(text);
     if (parsed.length === 0) continue; // Ignore transient loading flicker during refresh.
+    const sec = detectQuotaSection(text);
     const sig = windowsSignature(parsed);
     latestWindows = parsed;
+    latestSection = { section: sec.section, planHint: sec.planHint };
     latestSig = sig;
     if (sig !== initialSig) {
       if (sig !== lastChangeSig) {
@@ -102,12 +145,14 @@ export async function readSettledQuotaPanel(
 
   return {
     windows: latestWindows,
+    section: latestSection.section,
+    planHint: latestSection.planHint,
     refreshedDuringRead: latestSig !== initialSig,
     settleWaitMs: Math.max(0, Math.round(nowFn() - appearedAt)),
   };
 }
 
-const readPanel = `(() => { const e = [...document.querySelectorAll('[data-radix-popper-content-wrapper]')].find(e => { const r=e.getBoundingClientRect(); return r.width>0 && r.height>0 && !e.querySelector('[data-context-reset-reminder]') && e.innerText.includes('剩余额度'); }); return e?.innerText ?? null; })()`;
+const readPanel = `(() => { const e = [...document.querySelectorAll('[data-radix-popper-content-wrapper]')].find(e => { const r=e.getBoundingClientRect(); return r.width>0 && r.height>0 && !e.querySelector('[data-context-reset-reminder]') && (e.innerText.includes('剩余额度') || e.innerText.includes('今日余额')); }); return e?.innerText ?? null; })()`;
 
 export const hasBlockingPopoverExpr = OPEN_POPOVER_EXPR;
 
@@ -139,14 +184,18 @@ export async function zcodeQuota({
       await cdp.clickTestId("chat-context-usage-trigger");
       opened = true;
       const settled = await readSettledQuotaPanel(() => cdp.evaluate(readPanel), { settleMs });
-      const { windows, refreshedDuringRead, settleWaitMs } = settled;
+      const { windows, section, planHint, refreshedDuringRead, settleWaitMs } = settled;
       return {
-        source: "zcode_ui", observedAt: new Date().toISOString(),
-        status: windows.length ? "available" : "unavailable", windows,
+        source: "zcode_ui",
+        observedAt: new Date().toISOString(),
+        status: windows.length ? "available" : "unavailable",
+        section,
+        planHint,
+        windows,
         refreshedDuringRead,
         settleWaitMs,
         provider: null,
-        note: "Waits for ZCode's async hovercard refresh window before reading; account, provider, upstream timestamp and undisplayed windows remain unknown. Reset times are UI text in the app's timezone. Do not infer zero from missing data.",
+        note: "Waits for ZCode's async hovercard refresh window before reading (supports both 剩余额度 / 今日余额 panels); account, verified provider, upstream timestamp and undisplayed windows remain unknown. Reset times are UI text in the app's timezone. Do not infer zero from missing data.",
       };
     } finally {
       if (opened) {

@@ -129,10 +129,15 @@ function makeMenuCdp({
       }
       return {};
     },
-    async clickTestId(id) {
-      clicks.push(id);
+    async clickTestId(id, options) {
+      clicks.push(options ? { id, options } : id);
       if (id === "chat-model-select-trigger") {
         depth = 1;
+      } else if (id === "composer-provider-trigger") {
+        depth = 2;
+        if (onSelectModel) await onSelectModel(id, { setItems: (n) => (items = n), setDepth: (d) => (depth = d) });
+      } else if (id.startsWith("chat-model-select-group-registry-provider:")) {
+        if (onSelectModel) await onSelectModel(id, { setItems: (n) => (items = n), setDepth: (d) => (depth = d) });
       }
     },
     async clickElement(_expr, what) {
@@ -228,4 +233,38 @@ test("setModel skips redundant double-open when already selected and cleans up m
     /ZCode did not switch to model GLM-5\.3-Flash/,
   );
   assert.equal(failing.isMenuOpen, false);
+});
+
+test("setModel uses moveBeforeClick=false for Radix provider submenu and skips redundant model click when auto-checked", async () => {
+  const startPlanModel = "chat-model-select-item-custom:account%3Abigmodel-start-plan:GLM-5.3-Flash";
+  const personalModel = "chat-model-select-item-custom:account%3Abigmodel-individual-coding-plan:GLM-5.3-Flash";
+  const startPlanProvider = "chat-model-select-group-registry-provider:account:bigmodel-start-plan";
+  const switcher = makeMenuCdp({
+    modelItems: [{ testId: personalModel, checked: true, text: "GLM-5.3-Flash" }],
+    onSelectModel: async (id, { setItems, setDepth }) => {
+      if (id === "composer-provider-trigger") {
+        setItems([
+          { testId: personalModel, checked: true, text: "GLM-5.3-Flash" },
+          { testId: startPlanProvider, checked: false, text: "Start Plan" },
+        ]);
+      } else if (id === startPlanProvider) {
+        setDepth(1);
+        setItems([{ testId: startPlanModel, checked: true, text: "GLM-5.3-Flash" }]);
+      }
+    },
+  });
+  const plan = await setModel(switcher, "GLM-5.3-Flash", "account%3Abigmodel-start-plan", {
+    allowedProviders: [
+      "account%3Abigmodel-individual-coding-plan",
+      "account%3Abigmodel-start-plan",
+    ],
+    stepDelayMs: 1,
+  });
+  assert.equal(plan.provider, "account:bigmodel-start-plan");
+  assert.ok(
+    switcher.clicks.some(
+      (c) => typeof c === "object" && c.id === startPlanProvider && c.options?.moveBeforeClick === false,
+    ),
+  );
+  assert.equal(switcher.isMenuOpen, false);
 });

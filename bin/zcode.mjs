@@ -16,7 +16,7 @@ const USAGE = `usage: zcode <command>
   structured-result <taskId> [--domain-rule R]
   batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1]
       [--concurrency N] [--reserve-slots N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS]
-      [--state-dir DIR] [--model M] [--provider KEY] [--export OUT_FILE] [--summary OUT_FILE] [--compact]
+      [--state-dir DIR] [--model M] [--provider KEY] [--fallback-provider KEY] [--export OUT_FILE] [--summary OUT_FILE] [--compact]
   batch-status <batchId> [--state-dir DIR] [--compact]
   batch-export <batchId> [--out FILE] [--spec PRESET_OR_FILE] [--input JSONL_FILE] [--state-dir DIR] [--compact]
   quota                    read displayed remaining quota windows from ZCode UI
@@ -36,6 +36,7 @@ const VALUE_FLAGS = new Set([
   "--text",
   "--model",
   "--provider",
+  "--fallback-provider",
   "--task",
   "--schema",
   "--input",
@@ -183,6 +184,7 @@ const commands = {
       ...(stateDir ? { stateDir } : {}),
       model: flag("--model"),
       provider: flag("--provider"),
+      fallbackProvider: flag("--fallback-provider"),
     });
 
     if (exportPath) {

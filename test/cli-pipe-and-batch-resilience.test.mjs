@@ -578,3 +578,116 @@ test("swarm batch-export CLI recovers valid items from results.jsonl into atomic
     rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test("batch fallbackProvider automatically switches from Start Plan to Personal Plan on quota_or_rate_limit", async () => {
+  const stateDir = makeTempDir("fallback-provider-");
+  try {
+    const START_ENC = "account%3Abigmodel-start-plan";
+    const IND_ENC = "account%3Abigmodel-individual-coding-plan";
+    const submittedProviders = [];
+
+    // Part A: Single-item failover with maxRetries=0 — item 1 succeeds on Start Plan,
+    // item 2 hits quota_or_rate_limit on Start Plan -> automatically fails over to Personal Plan
+    // and completes item 2 + item 3 without blocking!
+    let seq = 0;
+    const summary = await runStructuredBatch({
+      batchId: "fallback-single-1",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      provider: "account:bigmodel-start-plan",
+      fallbackProvider: "account:bigmodel-individual-coding-plan",
+      items: [
+        { itemId: "f1", input: { expected: [1] } },
+        { itemId: "f2", input: { expected: [1] } },
+        { itemId: "f3", input: { expected: [1] } },
+      ],
+      maxConcurrency: 1,
+      maxRetries: 0,
+      stateDir,
+      runner: async ({ provider }) => {
+        submittedProviders.push(provider);
+        return { taskId: `session_fb_${++seq}_${provider === START_ENC ? "start" : "ind"}` };
+      },
+      evaluator: async (taskId) => {
+        if (taskId === "session_fb_2_start") {
+          return {
+            taskId,
+            status: "failed",
+            structuredStatus: "task_not_completed",
+            failureKind: "quota_or_rate_limit",
+            error: { code: "429" },
+          };
+        }
+        const pid = taskId.endsWith("_start")
+          ? "account:bigmodel-start-plan"
+          : "account:bigmodel-individual-coding-plan";
+        return {
+          taskId,
+          status: "completed",
+          structuredStatus: "valid",
+          value: { labels: [{ i: 1, level: 1, role: "title", conf: 1 }] },
+          model: { providerId: pid, modelId: "GLM-5.3-Flash" },
+          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, toolCalls: 0, modelRequests: 1 },
+        };
+      },
+      sleeper: async () => {},
+    });
+
+    assert.equal(summary.status, "completed");
+    assert.equal(summary.counts.valid, 3);
+    assert.equal(summary.provider, "account:bigmodel-start-plan");
+    assert.equal(summary.fallbackProvider, "account:bigmodel-individual-coding-plan");
+    assert.equal(summary.activeProvider, "account:bigmodel-individual-coding-plan");
+    assert.equal(summary.providerFallback.from, "account:bigmodel-start-plan");
+    assert.equal(summary.providerFallback.to, "account:bigmodel-individual-coding-plan");
+    assert.deepEqual(submittedProviders, [START_ENC, START_ENC, IND_ENC, IND_ENC]);
+
+    // Part B: If BOTH primary and fallback providers hit quota_or_rate_limit, trips blocker cleanly (no infinite loop)
+    let bothCalls = 0;
+    const bothBlocked = await runStructuredBatch({
+      batchId: "fallback-both-exhausted",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      provider: "account:bigmodel-start-plan",
+      fallbackProvider: "account:bigmodel-individual-coding-plan",
+      items: [
+        { itemId: "e1", input: { expected: [1] } },
+        { itemId: "e2", input: { expected: [1] } },
+      ],
+      maxConcurrency: 1,
+      maxRetries: 0,
+      stateDir,
+      runner: async ({ provider }) => ({ taskId: `session_both_${++bothCalls}_${provider === START_ENC ? "start" : "ind"}` }),
+      evaluator: async (taskId) => ({
+        taskId,
+        status: "failed",
+        structuredStatus: "task_not_completed",
+        failureKind: "quota_or_rate_limit",
+        error: { code: "429" },
+      }),
+      sleeper: async () => {},
+    });
+    assert.equal(bothBlocked.status, "blocked");
+    assert.equal(bothBlocked.blocked.code, "quota_or_rate_limit");
+    assert.equal(bothCalls, 2); // 1 on Start Plan + 1 on Personal Plan, then stops before e2!
+
+    // Part C: Disallowed fallbackProvider (e.g. personal pay-per-token API key) MUST be rejected
+    await assert.rejects(
+      runStructuredBatch({
+        batchId: "fallback-disallowed",
+        task: "Classify headings",
+        schema: SECTION_OUTLINE_SCHEMA,
+        provider: "account:bigmodel-start-plan",
+        fallbackProvider: "account:personal-api-key",
+        items: [{ itemId: "x1", input: { expected: [1] } }],
+        stateDir,
+        runner: async () => ({ taskId: "session_never" }),
+        evaluator: async () => ({ status: "pending", structuredStatus: "pending" }),
+        sleeper: async () => {},
+      }),
+      /is not enabled/,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

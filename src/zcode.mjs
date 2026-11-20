@@ -194,19 +194,31 @@ export async function setModel(cdp, model, provider, { allowedProviders = config
           },
           { timeout: 3000, interval: 150, what: "provider menu items to render" },
         );
+        if (stepDelayMs > 0) await sleep(Math.min(150, stepDelayMs));
       } else if (step.action === "click-provider") {
-        await cdp.clickTestId(step.testId);
+        // Radix DropdownMenuSubContent renders to the left of the model menu across a small gap;
+        // sending a synthetic mouseMoved jump fires SubTrigger.onPointerLeave and unmounts the
+        // submenu before mousePressed lands. Press+release directly on the target item instead.
+        await cdp.clickTestId(step.testId, { moveBeforeClick: false });
         await sleep(stepDelayMs);
         // Some Radix menus close on select; make sure the model list is the one we look at.
         if (!(await menuOpen(cdp))) await openModelMenu(cdp);
+        let itemsAfterProvider;
         try {
-          await waitFor(
-            async () => (await readMenuItems(cdp)).some((i) => i.testId.endsWith(`${plan.providerKey}:${model}`)),
-            { timeout: 4000, interval: 150, what: `model ${model} of provider ${plan.provider} to appear` },
+          itemsAfterProvider = await waitFor(
+            async () => {
+              const cur = await readMenuItems(cdp);
+              return cur.some((i) => i.testId.endsWith(`${plan.providerKey}:${model}`)) ? cur : null;
+            },
+            { timeout: Math.max(4000, verifyTimeout), interval: 150, what: `model ${model} of provider ${plan.provider} to appear` },
           );
         } catch {
           throw new Error(`Provider ${plan.provider} does not offer model ${model} in ZCode's model menu.`);
         }
+        const alreadyChecked = itemsAfterProvider.find(
+          (i) => i.checked && i.testId.startsWith(MODEL_ITEM_PREFIX) && i.testId.endsWith(`${plan.providerKey}:${model}`),
+        );
+        if (alreadyChecked) break;
       } else if (step.action === "click-model") {
         await cdp.clickElement(`document.querySelector('[data-testid=${JSON.stringify(step.testId)}]')`, `model menu item ${model} (${plan.provider})`);
         await sleep(stepDelayMs);

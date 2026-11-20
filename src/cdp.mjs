@@ -80,13 +80,17 @@ export class Cdp {
   }
 
   // Real pointer events are required: Radix menus ignore element.click().
-  async #clickAt({ x, y }) {
-    for (const type of ["mouseMoved", "mousePressed", "mouseReleased"])
+  // For Radix SubContent items, a synthetic mouseMoved jump out of the SubTrigger can fire
+  // pointerleave and unmount the submenu before mousePressed lands; callers may pass
+  // `{ moveBeforeClick: false }` to dispatch mousePressed + mouseReleased directly.
+  async #clickAt({ x, y }, { moveBeforeClick = true } = {}) {
+    const events = moveBeforeClick ? ["mouseMoved", "mousePressed", "mouseReleased"] : ["mousePressed", "mouseReleased"];
+    for (const type of events)
       await this.call("Input.dispatchMouseEvent", { type, x, y, button: "left", buttons: type === "mousePressed" ? 1 : 0, clickCount: 1 });
   }
 
   // `elementExpr` is a JS expression evaluating to a DOM element (or null).
-  async clickElement(elementExpr, what) {
+  async clickElement(elementExpr, what, options) {
     const pt = await this.evaluate(`(() => {
       const e = (${elementExpr});
       if (!e) return null;
@@ -111,11 +115,11 @@ export class Cdp {
         : "";
       throw new Error(`UI element is blocked by another element: ${what ?? elementExpr}${detail}. Check for an open dialog or overlay.`);
     }
-    await this.#clickAt(pt);
+    await this.#clickAt(pt, options);
   }
 
-  clickTestId(testId) {
-    return this.clickElement(`document.querySelector('[data-testid=${JSON.stringify(testId)}]')`, testId);
+  clickTestId(testId, options) {
+    return this.clickElement(`document.querySelector('[data-testid=${JSON.stringify(testId)}]')`, testId, options);
   }
 
   clickText(text) {

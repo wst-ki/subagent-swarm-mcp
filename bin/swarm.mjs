@@ -26,7 +26,7 @@ const USAGE = `usage: swarm <command>
       [--backend auto|codebuddy|qoder|zcode] [--profile P] [--cwd DIR] [--model M] [--effort L] [--max-turns N] [--ephemeral] [--wait [SEC]]
   structured-result <taskId> [--domain-rule R]
   batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1]
-      [--backend auto|codebuddy|qoder|zcode] [--profile P] [--cwd DIR] [--model M] [--provider KEY] [--effort L] [--max-turns N]
+      [--backend auto|codebuddy|qoder|zcode] [--profile P] [--cwd DIR] [--model M] [--provider KEY] [--fallback-provider KEY] [--effort L] [--max-turns N]
       [--concurrency N] [--reserve-slots N] [--max-credit N] [--max-batch-chars N] [--timeout-ms MS]
       [--capacity-wait-ms MS] [--state-dir DIR] [--ephemeral] [--export OUT_FILE] [--summary OUT_FILE] [--compact]
   batch-status <batchId> [--state-dir DIR] [--compact]
@@ -48,6 +48,7 @@ const VALUE_FLAGS = new Set([
   "--model",
   "--fallback-model",
   "--provider",
+  "--fallback-provider",
   "--effort",
   "--max-turns",
   "--system-prompt",
@@ -267,6 +268,7 @@ const commands = {
       addDirs: listFlag("--add-dir"),
       model: flag("--model"),
       provider: flag("--provider"),
+      fallbackProvider: flag("--fallback-provider"),
     });
 
     if (exportPath) {

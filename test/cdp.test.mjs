@@ -19,6 +19,24 @@ test("blocked element never dispatches a pointer event and reports blocker detai
   );
 });
 
+test("clickElement supports moveBeforeClick=false to avoid Radix submenu pointerleave unmount", async () => {
+  const cdp = new Cdp();
+  const seen = [];
+  cdp.evaluate = async () => ({ x: 100, y: 200, blocked: false, blocker: null });
+  cdp.call = async (method, params) => {
+    if (method === "Input.dispatchMouseEvent") seen.push(params.type);
+    return {};
+  };
+  await cdp.clickElement("target", "default-click");
+  assert.deepEqual(seen, ["mouseMoved", "mousePressed", "mouseReleased"]);
+
+  seen.length = 0;
+  await cdp.clickTestId("chat-model-select-group-registry-provider:account:bigmodel-start-plan", {
+    moveBeforeClick: false,
+  });
+  assert.deepEqual(seen, ["mousePressed", "mouseReleased"]);
+});
+
 test("authentication and other dialogs are reported without interaction", async () => {
   const visible = (text = "") => ({ innerText: text, getBoundingClientRect: () => ({ width: 10, height: 10 }) });
   const inspect = (dialogs, oauth = null) => uiBlocker({

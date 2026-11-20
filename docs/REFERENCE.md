@@ -39,7 +39,7 @@ Detailed specification for **subagent-swarm-mcp** (legacy bin `glm-zcode-mcp`) M
 | `zcode_health {}` | Check DevTools port, target project visibility, running count, and known login/dialog blockers. |
 | `zcode_quota {}` | Briefly open the UI context hover card under the UI lock and parse displayed quota windows. |
 
-> **`zcode_quota` caveats:** Holds the hovercard open for a brief settle window (`ZCODE_MCP_QUOTA_SETTLE_MS`, default `1200` ms, converging early once an async UI update stabilizes) so ZCode's background entitlement refresh completes instead of returning the previous open's cached percentage (`refreshedDuringRead` indicates whether the DOM updated during the wait). Missing or unrecognized windows report as unknown (never zero). Displayed account/provider identity cannot be independently verified, so do not use it as an automated billing-route gate. It never clicks reset actions or handles credentials.
+> **`zcode_quota` caveats:** Holds the hovercard open for a brief settle window (`ZCODE_MCP_QUOTA_SETTLE_MS`, default `1200` ms, converging early once an async UI update stabilizes) so ZCode's background entitlement refresh completes instead of returning the previous open's cached percentage (`refreshedDuringRead` indicates whether the DOM updated during the wait). Parses both **BigModel 个人** (`剩余额度`: `5 小时` / `每周` / `工具调用` / `ZCode MCP`) and **Start Plan 免费** (`今日余额`: per-model daily quota rows such as `GLM-5.3-Flash`, skipping promo badges like `150% 配额`), returning `section` and `planHint`. Missing or unrecognized windows report as unknown (never zero). Displayed account/provider identity cannot be independently verified, so do not use it as an automated billing-route gate. It never clicks reset actions or handles credentials.
 
 ### Legacy ZCode Session Snapshots, Events & Model IO (4)
 
@@ -56,7 +56,7 @@ Detailed specification for **subagent-swarm-mcp** (legacy bin `glm-zcode-mcp`) M
 |---|---|
 | `zcode_run_structured {task, input, schema, domainRule?, model?, provider?}` | Start a ZCode session with a bounded JSON Schema contract and optional preset or declarative `domainRule`. Contract is stored in the initial user prompt. |
 | `zcode_structured_result {taskId, domainRule?}` | Recover the original contract from SQLite and validate the final JSON response (`valid`, `invalid`, `pending`, or `task_not_completed`). |
-| `zcode_batch_run {batchId, task, schema, items, domainRule?, templateId?, model?, provider?, maxConcurrency?, reserveSlots?, maxRetries?, microbatchSize?, maxBatchInputChars?, capacityWaitMs?, includeItems?}` | Run or idempotently resume a JSONL-checkpointed batch on ZCode (`backend: "zcode"`), with optional `reserveSlots` yielding for concurrent interactive work. |
+| `zcode_batch_run {batchId, task, schema, items, domainRule?, templateId?, model?, provider?, fallbackProvider?, maxConcurrency?, reserveSlots?, maxRetries?, microbatchSize?, maxBatchInputChars?, capacityWaitMs?, includeItems?}` | Run or idempotently resume a JSONL-checkpointed batch on ZCode (`backend: "zcode"`), with optional `reserveSlots` yielding and allow-listed `fallbackProvider` automatic failover on quota exhaustion (e.g. `Start Plan 免费` -> `BigModel 个人`). |
 | `zcode_batch_status {batchId, includeItems?}` | Read `<stateDir>/batches/<batchId>/` checkpoint manifest, per-item statuses (omitted when `includeItems: false`), deduplicated token usage, and circuit-breaker state (`blocked.json`). |
 
 ### Dispatch Hub (10) & CodeBuddy Credit (1)
@@ -131,14 +131,14 @@ All binaries are exposed via `package.json` `bin` (or `node bin/<name>.mjs`):
 * `swarm run (--file F | --text T | stdin) [--backend auto|codebuddy|qoder|zcode] [--profile lite|readonly|workspace] [--cwd DIR] [--model M] [--fallback-model M] [--ephemeral] [--wait [SEC]]`
 * `swarm run-structured --task T --schema JSON_OR_FILE --input JSON_OR_FILE [--domain-rule R] [--backend ...] [--profile ...] [--cwd DIR] [--ephemeral] [--wait [SEC]]`
 * `swarm structured-result <taskId>` | `swarm wait <taskId> [SEC]` | `swarm status|result|cancel <taskId>` | `swarm followup <taskId> (--text T | --file F | stdin) [--model M]`
-* `swarm batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1] [--backend ...] [--concurrency N] [--reserve-slots N] [--max-credit N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS] [--state-dir DIR] [--ephemeral] [--export OUT] [--summary OUT] [--compact]`
+* `swarm batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1] [--backend ...] [--provider KEY] [--fallback-provider KEY] [--concurrency N] [--reserve-slots N] [--max-credit N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS] [--state-dir DIR] [--ephemeral] [--export OUT] [--summary OUT] [--compact]`
 * `swarm batch-status <batchId> [--state-dir DIR] [--compact]` | `swarm batch-export <batchId> [--out FILE] [--spec PRESET_OR_FILE] [--input JSONL_FILE] [--state-dir DIR] [--compact]`
 
 ### `zcode` (`bin/zcode.mjs`) & `zcode-watch` (`bin/zcode-watch.mjs`)
 * `zcode run (--file F | --text T | stdin) [--model M] [--provider KEY]`
 * `zcode run-structured --task T --schema JSON_OR_FILE --input JSON_OR_FILE [--domain-rule R]`
 * `zcode structured-result <taskId> [--domain-rule R]`
-* `zcode batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1] [--concurrency N] [--reserve-slots N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS] [--state-dir DIR] [--model M] [--provider KEY] [--export OUT] [--summary OUT] [--compact]`
+* `zcode batch --id ID --spec PRESET_OR_FILE --input JSONL_FILE [--limit N] [--microbatch K] [--retries 0|1] [--concurrency N] [--reserve-slots N] [--max-batch-chars N] [--timeout-ms MS] [--capacity-wait-ms MS] [--state-dir DIR] [--model M] [--provider KEY] [--fallback-provider KEY] [--export OUT] [--summary OUT] [--compact]`
 * `zcode batch-status <batchId> [--state-dir DIR] [--compact]` | `zcode batch-export <batchId> [--out FILE] [--spec PRESET_OR_FILE] [--input JSONL_FILE] [--state-dir DIR] [--compact]` | `zcode status|result|cancel|list|health|quota` | `zcode followup <taskId> ...` | `zcode progress <taskId> [--refresh]`
 * `zcode-watch <taskId...> [--every SEC] [--timeout SEC] [--quiet]`: exits `0` when all tasks finish (`DONE`), `3` on `ATTENTION`, `4` when `--timeout` expires with tasks still running, `2` on usage error.
 
