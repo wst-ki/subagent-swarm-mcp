@@ -700,7 +700,7 @@ export async function runStructuredBatch({
         }, submittedRoute));
         consecutiveSubmissionErrors = 0;
       } catch (err) {
-        if (err?.abortedByBlocker) return;
+        if (err?.abortedByBlocker || blockedReason) return;
         const msg = String(err?.message ?? err);
         const isCapacityExhausted = Boolean(err?.capacityExhausted);
         const isQuotaOrRouteUnavailable =
@@ -716,7 +716,7 @@ export async function runStructuredBatch({
         }
         const isAuthOrBlocker =
           !isCapacityExhausted &&
-          /login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
+          /SEND_FAILED|ZCode UI rejected send|login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
         if (!isCapacityExhausted) consecutiveSubmissionErrors++;
         const hitConsecutiveLimit =
           !isCapacityExhausted &&
@@ -941,7 +941,7 @@ export async function runStructuredBatch({
         }, submittedRoute));
         consecutiveSubmissionErrors = 0;
       } catch (err) {
-        if (err?.abortedByBlocker) return;
+        if (err?.abortedByBlocker || blockedReason) return;
         const msg = String(err?.message ?? err);
         const isCapacityExhausted = Boolean(err?.capacityExhausted);
         const isQuotaOrRouteUnavailable =
@@ -957,7 +957,7 @@ export async function runStructuredBatch({
         }
         const isAuthOrBlocker =
           !isCapacityExhausted &&
-          /login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
+          /SEND_FAILED|ZCode UI rejected send|login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
         if (!isCapacityExhausted) consecutiveSubmissionErrors++;
         const hitConsecutiveLimit =
           !isCapacityExhausted &&

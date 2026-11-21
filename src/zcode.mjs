@@ -1,6 +1,8 @@
 // High-level operations against the running ZCode desktop app.
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { Cdp, ZcodeUnavailableError, sleep, waitFor } from "./cdp.mjs";
-import { config } from "./config.mjs";
+import { config, paths } from "./config.mjs";
 import { withUiLock } from "./lock.mjs";
 import { MODEL_ITEM_PREFIX, PROVIDER_ITEM_PREFIX, normalizeProviderKey, planModelSelection, resolveProvider } from "./model-select.mjs";
 import { findSessionByPrompt, finalAnswer, listSessions, runningSessions, sessionProviderId, sessionRow, taskStatus, tailer } from "./store.mjs";
@@ -407,6 +409,96 @@ export async function readComposerSendError(cdp) {
   })()`);
 }
 
+/**
+ * Safe CDP renderer-only reload (`Page.reload`) to self-heal a stalled ZCode Electron draft-session
+ * state machine (e.g. `SEND_FAILED: 草稿会话尚未开始创建` after hours of running) without restarting
+ * the ZCode process or losing login state.
+ *
+ * Safety invariants:
+ * - Never reloads while `runningSessions().length > 0` (zero risk to in-flight tasks).
+ * - Enforces a cross-process cooldown (`ZCODE_MCP_RENDERER_RELOAD_COOLDOWN_MS`, default 120 s) so
+ *   repeated errors cannot trigger a reload loop.
+ * - Fails closed with `ZcodeUnavailableError` if reload lands on a login/auth dialog.
+ */
+export async function reloadRendererIfSafe(
+  cdp,
+  {
+    reason = "SEND_FAILED",
+    enabled = config.autoReloadRenderer,
+    cooldownMs = config.rendererReloadCooldownMs,
+    statePath = paths.rendererReloadState,
+    projectName = config.projectName,
+    cdpPort = config.cdpPort,
+    timeoutMs = 20_000,
+    settleMs = 1000,
+    runningSessionsFn = runningSessions,
+    connectFn = (port) => Cdp.connect(port),
+    nowFn = Date.now,
+    sleeper = sleep,
+  } = {},
+) {
+  if (!enabled) return { reloaded: false, skipped: "disabled" };
+  if (typeof cdp?.call !== "function") return { reloaded: false, skipped: "no_cdp_call" };
+  const active = runningSessionsFn();
+  if (Array.isArray(active) && active.length > 0) return { reloaded: false, skipped: "tasks_running" };
+
+  const now = nowFn();
+  if (cooldownMs > 0 && statePath && existsSync(statePath)) {
+    try {
+      const prev = JSON.parse(readFileSync(statePath, "utf8"));
+      if (Number.isFinite(prev?.at) && now - prev.at < cooldownMs) {
+        return { reloaded: false, skipped: "cooldown", lastReloadAt: prev.at };
+      }
+    } catch {}
+  }
+
+  if (statePath) {
+    try {
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, JSON.stringify({ at: now, reason, pid: process.pid }), "utf8");
+    } catch {}
+  }
+
+  try {
+    await cdp.call("Page.reload", { ignoreCache: false });
+  } catch (err) {
+    return { reloaded: false, skipped: "reload_failed", error: err?.message ?? String(err) };
+  } finally {
+    try {
+      cdp.close?.();
+    } catch {}
+  }
+
+  if (settleMs > 0) await sleeper(settleMs);
+  const deadline = nowFn() + timeoutMs;
+  while (nowFn() <= deadline) {
+    let fresh = null;
+    try {
+      fresh = await connectFn(cdpPort);
+      const blocker = await uiBlocker(fresh);
+      if (blocker) {
+        fresh.close?.();
+        throw new ZcodeUnavailableError(blocker.message);
+      }
+      const ready = await fresh.evaluate(`(() => {
+        const visible = (e) => { if (!e) return false; const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+        const hasProject = [...document.querySelectorAll('[data-testid="virtual-project-toggle"]')].some(t => visible(t) && (t.innerText || '').trim() === ${JSON.stringify(projectName)});
+        if (!hasProject) return false;
+        return visible(document.querySelector('[data-testid="v4-composer-input"]')) || visible(document.querySelector('[data-testid="task-new-button"]'));
+      })()`);
+      if (ready) return { reloaded: true, cdp: fresh };
+      fresh.close?.();
+    } catch (err) {
+      try {
+        fresh?.close?.();
+      } catch {}
+      if (err instanceof ZcodeUnavailableError) throw err;
+    }
+    await sleeper(500);
+  }
+  return { reloaded: false, skipped: "reload_timeout" };
+}
+
 function assertCapacity() {
   const running = runningSessions();
   if (running.length >= config.maxRunning)
@@ -422,104 +514,117 @@ export async function runTask({ prompt, model, provider }) {
   // Billing route: defaults to ZCODE_MCP_PROVIDER, must be one of ZCODE_MCP_PROVIDERS.
   const route = resolveProvider(provider ?? config.providerKey, config.allowedProviders);
 
-  return withUiLock(() =>
-    withCdp(async (cdp) => {
+  return withUiLock(async () => {
+    let activeCdp = await Cdp.connect(config.cdpPort);
+    const submitOnce = async (cdp) => {
+      assertCapacity(); // inside the lock so concurrent submitters can't both squeeze past the limit
+      await ensureWorkspace(cdp);
+      // New task in the configured project (found by its sidebar label).
+      const createTaskExpr = `(() => { let n = [...document.querySelectorAll('[data-testid="virtual-project-toggle"]')].find(t => t.innerText.trim() === ${JSON.stringify(config.projectName)});
+                for (let i = 0; n && i < 6; i++) { n = n.parentElement; const b = n?.querySelector('[data-testid="virtual-project-create-task"]'); if (b) return b; }
+                return null; })()`;
+      const createTaskLabel = `"new task" button of project "${config.projectName}"`;
       try {
-        assertCapacity(); // inside the lock so concurrent submitters can't both squeeze past the limit
-        await ensureWorkspace(cdp);
-        // New task in the configured project (found by its sidebar label).
-        const createTaskExpr = `(() => { let n = [...document.querySelectorAll('[data-testid="virtual-project-toggle"]')].find(t => t.innerText.trim() === ${JSON.stringify(config.projectName)});
-                  for (let i = 0; n && i < 6; i++) { n = n.parentElement; const b = n?.querySelector('[data-testid="virtual-project-create-task"]'); if (b) return b; }
-                  return null; })()`;
-        const createTaskLabel = `"new task" button of project "${config.projectName}"`;
-        try {
+        await cdp.clickElement(createTaskExpr, createTaskLabel);
+      } catch (err) {
+        // One safe retry if a transient non-dialog popover appeared right between ensureWorkspace and click.
+        if (/blocked by another element/i.test(err?.message ?? "") && !(await uiBlocker(cdp)) && (await closeOpenMenu(cdp))) {
           await cdp.clickElement(createTaskExpr, createTaskLabel);
-        } catch (err) {
-          // One safe retry if a transient non-dialog popover appeared right between ensureWorkspace and click.
-          if (/blocked by another element/i.test(err?.message ?? "") && !(await uiBlocker(cdp)) && (await closeOpenMenu(cdp))) {
-            await cdp.clickElement(createTaskExpr, createTaskLabel);
-          } else {
-            throw err;
-          }
+        } else {
+          throw err;
         }
-        let project;
-        try {
-          project = await waitForNewTaskComposer(cdp, { timeout: 3500 });
-        } catch {
-          // A sidebar re-render during high load can swallow the first click; retry once if no dialog blocks.
-          if (await uiBlocker(cdp)) throw new ZcodeUnavailableError((await uiBlocker(cdp)).message);
-          await closeOpenMenu(cdp).catch(() => {});
-          await cdp.clickElement(createTaskExpr, createTaskLabel);
-          project = await waitForNewTaskComposer(cdp, { timeout: 6000 });
-        }
-        if (project !== config.projectName)
-          throw new Error(`New task opened in project "${project}", expected "${config.projectName}". Refusing to send.`);
-
-        await setMode(cdp);
-        await setModel(cdp, model, route.encoded);
-        await typePrompt(cdp, prompt);
-
-        const t0 = Date.now();
-        try {
-          await waitForSendEnabled(cdp);
-          await cdp.clickTestId("v4-composer-send");
-        } catch (e) {
-          await clearComposer(cdp);
-          throw e;
-        }
-        let sid;
-        try {
-          sid = await waitFor(
-            async () => {
-              const found = findSessionByPrompt(prompt, t0 - 3000);
-              if (found) return found;
-              if (await cdp.hasTestId("start-plan-recommendation-dialog")) {
-                if (route.decoded === "account:bigmodel-start-plan") {
-                  await cdp.clickTestId("confirm-dialog-confirm");
-                } else {
-                  await cdp
-                    .evaluate(`(() => { const cb = document.querySelector('[data-testid="start-plan-recommendation-dialog"] [role="checkbox"]'); if (cb && cb.getAttribute('aria-checked') === 'false') cb.click(); })()`)
-                    .catch(() => {});
-                  await sleep(100);
-                  await cdp.clickElement(
-                    `[...document.querySelectorAll('[data-testid="start-plan-recommendation-dialog"] button')].find(b => (b.innerText||'').trim() === '不了')`,
-                    `decline start-plan switch ("不了")`,
-                  );
-                }
-                await sleep(300);
-                return null;
-              }
-              if (Date.now() - t0 >= 1200) {
-                const sendErr = await readComposerSendError(cdp).catch(() => null);
-                if (sendErr) {
-                  const err = new Error(
-                    `ZCode UI rejected send (${sendErr.code}): ${sendErr.text || "send failed"}. Restart ZCode if this persists.`,
-                  );
-                  err.sendErrorCode = sendErr.code;
-                  throw err;
-                }
-              }
-              return null;
-            },
-            { timeout: 30_000, interval: 400, what: "ZCode to create the session" },
-          );
-        } catch (err) {
-          await clearComposer(cdp).catch(() => {});
-          if (err?.sendErrorCode) throw err;
-          throw new Error("The send button was clicked, but no matching new session was found in ZCode's database. The outcome is uncertain; inspect the composer and zcode_list before retrying to avoid duplicates.");
-        }
-        const row = sessionRow(sid);
-        const out = { taskId: sid, model, provider: route.decoded, project: config.projectName, directory: row?.directory ?? null, mode: FULL_ACCESS };
-        // The menu can lie (a run once went to another billing route); the session's own record cannot.
-        const actual = await actualProviderId(sid);
-        if (actual && normalizeProviderKey(actual).encoded !== route.encoded)
-          out.warning = `ZCode is running this session on provider "${actual}" instead of the requested "${route.decoded}". The prompt was sent anyway; check the run's billing.`;
-        return out;
-      } finally {
-        await closeOpenMenu(cdp).catch(() => {});
       }
-    }),
-  );
+      let project;
+      try {
+        project = await waitForNewTaskComposer(cdp, { timeout: 3500 });
+      } catch {
+        // A sidebar re-render during high load can swallow the first click; retry once if no dialog blocks.
+        if (await uiBlocker(cdp)) throw new ZcodeUnavailableError((await uiBlocker(cdp)).message);
+        await closeOpenMenu(cdp).catch(() => {});
+        await cdp.clickElement(createTaskExpr, createTaskLabel);
+        project = await waitForNewTaskComposer(cdp, { timeout: 6000 });
+      }
+      if (project !== config.projectName)
+        throw new Error(`New task opened in project "${project}", expected "${config.projectName}". Refusing to send.`);
+
+      await setMode(cdp);
+      await setModel(cdp, model, route.encoded);
+      await typePrompt(cdp, prompt);
+
+      const t0 = Date.now();
+      try {
+        await waitForSendEnabled(cdp);
+        await cdp.clickTestId("v4-composer-send");
+      } catch (e) {
+        await clearComposer(cdp);
+        throw e;
+      }
+      let sid;
+      try {
+        sid = await waitFor(
+          async () => {
+            const found = findSessionByPrompt(prompt, t0 - 3000);
+            if (found) return found;
+            if (await cdp.hasTestId("start-plan-recommendation-dialog")) {
+              if (route.decoded === "account:bigmodel-start-plan") {
+                await cdp.clickTestId("confirm-dialog-confirm");
+              } else {
+                await cdp
+                  .evaluate(`(() => { const cb = document.querySelector('[data-testid="start-plan-recommendation-dialog"] [role="checkbox"]'); if (cb && cb.getAttribute('aria-checked') === 'false') cb.click(); })()`)
+                  .catch(() => {});
+                await sleep(100);
+                await cdp.clickElement(
+                  `[...document.querySelectorAll('[data-testid="start-plan-recommendation-dialog"] button')].find(b => (b.innerText||'').trim() === '不了')`,
+                  `decline start-plan switch ("不了")`,
+                );
+              }
+              await sleep(300);
+              return null;
+            }
+            if (Date.now() - t0 >= 1200) {
+              const sendErr = await readComposerSendError(cdp).catch(() => null);
+              if (sendErr) {
+                const err = new Error(
+                  `ZCode UI rejected send (${sendErr.code}): ${sendErr.text || "send failed"}. Restart ZCode if this persists.`,
+                );
+                err.sendErrorCode = sendErr.code;
+                throw err;
+              }
+            }
+            return null;
+          },
+          { timeout: 30_000, interval: 400, what: "ZCode to create the session" },
+        );
+      } catch (err) {
+        await clearComposer(cdp).catch(() => {});
+        if (err?.sendErrorCode) throw err;
+        throw new Error("The send button was clicked, but no matching new session was found in ZCode's database. The outcome is uncertain; inspect the composer and zcode_list before retrying to avoid duplicates.");
+      }
+      const row = sessionRow(sid);
+      const out = { taskId: sid, model, provider: route.decoded, project: config.projectName, directory: row?.directory ?? null, mode: FULL_ACCESS };
+      // The menu can lie (a run once went to another billing route); the session's own record cannot.
+      const actual = await actualProviderId(sid);
+      if (actual && normalizeProviderKey(actual).encoded !== route.encoded)
+        out.warning = `ZCode is running this session on provider "${actual}" instead of the requested "${route.decoded}". The prompt was sent anyway; check the run's billing.`;
+      return out;
+    };
+
+    try {
+      try {
+        return await submitOnce(activeCdp);
+      } catch (err) {
+        if (!err?.sendErrorCode) throw err;
+        const recovery = await reloadRendererIfSafe(activeCdp, { reason: err.sendErrorCode });
+        if (!recovery.reloaded || !recovery.cdp) throw err;
+        activeCdp = recovery.cdp;
+        const retried = await submitOnce(activeCdp);
+        return { ...retried, rendererReloaded: true };
+      }
+    } finally {
+      await closeOpenMenu(activeCdp).catch(() => {});
+      activeCdp.close();
+    }
+  });
 }
 
 /** Send a follow-up message to an existing (finished) task. */

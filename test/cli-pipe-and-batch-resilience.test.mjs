@@ -838,7 +838,35 @@ test("batch halts with restart_zcode_ui breaker after consecutive submission fai
 
   const stateDir = makeTempDir("consec-sub-breaker-");
   try {
-    // 5 microbatch chunks (10 items), all failing submission with SEND_FAILED -> MUST trip breaker at chunk #3, leaving items 7..10 untouched pending!
+    // Part A: Confirmed SEND_FAILED trips circuit_breaker IMMEDIATELY on chunk #1 (0 submission_error pollution!)
+    let sfCalls = 0;
+    const sfRes = await runStructuredBatch({
+      batchId: "send-failed-instant",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      provider: "account:bigmodel-start-plan",
+      microbatchSize: 2,
+      maxConcurrency: 1,
+      maxRetries: 0,
+      items: Array.from({ length: 10 }, (_, i) => ({ itemId: `sf${i + 1}`, input: { expected: [1] } })),
+      stateDir,
+      runner: async () => {
+        sfCalls++;
+        throw new Error("ZCode UI rejected send (SEND_FAILED): 发送失败，请稍后重试。草稿会话尚未开始创建. Restart ZCode if this persists.");
+      },
+      evaluator: async () => ({ status: "pending", structuredStatus: "pending" }),
+      sleeper: async () => {},
+    });
+    assert.equal(sfRes.status, "blocked");
+    assert.equal(sfRes.blocked.code, "submission_circuit_breaker");
+    assert.equal(sfRes.blocked.retryable, true);
+    assert.equal(sfRes.blocked.recommendedAction, "restart_zcode_ui");
+    assert.equal(sfCalls, 1); // Halted IMMEDIATELY on chunk #1!
+    assert.equal(sfRes.counts.pending, 8);
+    assert.equal(sfRes.counts.failed, 2);
+    assert.equal(sfRes.items.filter((it) => it.failureKind === "submission_error").length, 0);
+
+    // Part B: Generic non-SEND_FAILED submission errors (e.g. no matching new session) halt after maxConsecutiveSubmissionErrors=3
     let calls = 0;
     const res = await runStructuredBatch({
       batchId: "send-failed-halt",
@@ -853,7 +881,7 @@ test("batch halts with restart_zcode_ui breaker after consecutive submission fai
       stateDir,
       runner: async () => {
         calls++;
-        throw new Error("ZCode UI rejected send (SEND_FAILED): 发送失败，请稍后重试。草稿会话尚未开始创建. Restart ZCode if this persists.");
+        throw new Error("The send button was clicked, but no matching new session was found in ZCode's database.");
       },
       evaluator: async () => ({ status: "pending", structuredStatus: "pending" }),
       sleeper: async () => {},
@@ -867,7 +895,7 @@ test("batch halts with restart_zcode_ui breaker after consecutive submission fai
     assert.equal(res.counts.pending, 4); // Remaining 4 items preserved cleanly as pending
     assert.equal(res.counts.failed, 6);
 
-    // Resuming after ZCode UI restart completes ALL 10 items (including the 6 failed ones)
+    // Part C: Resuming after ZCode UI restart completes ALL 10 items (including the 6 failed ones)
     let resumedCalls = 0;
     const resumed = await runStructuredBatch({
       batchId: "send-failed-halt",

@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runInNewContext } from "node:vm";
-import { closeOpenMenu, readComposerSendError, setMode, setModel, waitForNewTaskComposer, waitForSendEnabled } from "../src/zcode.mjs";
+import { closeOpenMenu, readComposerSendError, reloadRendererIfSafe, setMode, setModel, waitForNewTaskComposer, waitForSendEnabled } from "../src/zcode.mjs";
 
 function makeFakeCdp({ initialMode = "变更前确认", withDialog = false, stayDisabled = false } = {}) {
   let mode = initialMode;
@@ -360,4 +363,107 @@ test("readComposerSendError detects visible SEND_FAILED banners and ignores hidd
 
   // Unrelated benign alert -> ignored
   assert.equal(await readComposerSendError(makeBannerCdp({ alerts: [el({ text: "Copied to clipboard" })] })), null);
+});
+
+test("reloadRendererIfSafe skips when tasks run or within cooldown, reloads cleanly when idle, and fails closed on auth dialog", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "zcode-reload-test-"));
+  const statePath = join(dir, "renderer-reload.json");
+  try {
+    let reloadCalls = 0;
+    const makeOldCdp = () => ({
+      closed: false,
+      async call(method) {
+        if (method === "Page.reload") reloadCalls++;
+        return {};
+      },
+      close() {
+        this.closed = true;
+      },
+    });
+    const makeFreshCdp = ({ ready = true, authDialog = false } = {}) => ({
+      closed: false,
+      close() {
+        this.closed = true;
+      },
+      async evaluate(expression) {
+        const box = () => ({ width: 20, height: 20 });
+        return runInNewContext(expression, {
+          document: {
+            querySelector(sel) {
+              if (sel.includes("oauth-cancel")) return null;
+              if (sel.includes("v4-composer-input")) return ready ? { getBoundingClientRect: box } : null;
+              return null;
+            },
+            querySelectorAll(sel) {
+              if (sel.includes("alertdialog")) return authDialog ? [{ innerText: "登录已过期", getBoundingClientRect: box }] : [];
+              if (sel.includes("virtual-project-toggle")) return ready ? [{ innerText: "subagent", getBoundingClientRect: box }] : [];
+              return [];
+            },
+          },
+        });
+      },
+    });
+
+    // 1. Running tasks active -> MUST NOT reload
+    const busy = await reloadRendererIfSafe(makeOldCdp(), {
+      statePath,
+      runningSessionsFn: () => ["sess_busy"],
+      sleeper: async () => {},
+    });
+    assert.deepEqual(busy, { reloaded: false, skipped: "tasks_running" });
+    assert.equal(reloadCalls, 0);
+
+    // 2. Idle -> reloads once, closes old socket, returns live fresh cdp
+    let now = 1_000_000;
+    const old1 = makeOldCdp();
+    const fresh1 = makeFreshCdp({ ready: true });
+    const ok = await reloadRendererIfSafe(old1, {
+      statePath,
+      projectName: "subagent",
+      cooldownMs: 120_000,
+      settleMs: 0,
+      runningSessionsFn: () => [],
+      connectFn: async () => fresh1,
+      nowFn: () => now,
+      sleeper: async () => {},
+    });
+    assert.equal(ok.reloaded, true);
+    assert.equal(ok.cdp, fresh1);
+    assert.equal(old1.closed, true);
+    assert.equal(reloadCalls, 1);
+
+    // 3. Within cooldown window -> MUST skip without reloading again
+    now += 30_000;
+    const cooled = await reloadRendererIfSafe(makeOldCdp(), {
+      statePath,
+      projectName: "subagent",
+      cooldownMs: 120_000,
+      settleMs: 0,
+      runningSessionsFn: () => [],
+      connectFn: async () => makeFreshCdp({ ready: true }),
+      nowFn: () => now,
+      sleeper: async () => {},
+    });
+    assert.equal(cooled.reloaded, false);
+    assert.equal(cooled.skipped, "cooldown");
+    assert.equal(reloadCalls, 1);
+
+    // 4. After cooldown, if reload lands on an auth dialog -> fails closed with ZcodeUnavailableError
+    now += 130_000;
+    await assert.rejects(
+      reloadRendererIfSafe(makeOldCdp(), {
+        statePath,
+        projectName: "subagent",
+        cooldownMs: 120_000,
+        settleMs: 0,
+        runningSessionsFn: () => [],
+        connectFn: async () => makeFreshCdp({ ready: false, authDialog: true }),
+        nowFn: () => now,
+        sleeper: async () => {},
+      }),
+      /login has expired/i,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

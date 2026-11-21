@@ -36,10 +36,14 @@ export const config = {
   startingTimeoutSec: Number(env.ZCODE_MCP_STARTING_TIMEOUT_SEC ?? 300),
   // Minimum seconds between real Gemini summary calls per task; see src/progress.mjs.
   summaryMinSec: Number(env.ZCODE_MCP_SUMMARY_MIN_SEC ?? 300),
+  // Safe renderer self-heal via CDP Page.reload when ZCode hits SEND_FAILED while idle (0 running tasks).
+  autoReloadRenderer: !/^(0|false|off|no)$/i.test(String(env.ZCODE_MCP_AUTO_RELOAD ?? "1")),
+  rendererReloadCooldownMs: Math.max(0, Number(env.ZCODE_MCP_RENDERER_RELOAD_COOLDOWN_MS ?? 120_000)),
 };
 
 export const paths = {
   cliDb: join(config.zcodeHome, "cli", "db", "db.sqlite"),
   cliLogDir: join(config.zcodeHome, "cli", "log"),
   uiLock: join(config.stateDir, "ui.lock"),
+  rendererReloadState: join(config.stateDir, "renderer-reload.json"),
 };
