@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
-import { closeOpenMenu, setMode, setModel, waitForNewTaskComposer, waitForSendEnabled } from "../src/zcode.mjs";
+import { closeOpenMenu, readComposerSendError, setMode, setModel, waitForNewTaskComposer, waitForSendEnabled } from "../src/zcode.mjs";
 
 function makeFakeCdp({ initialMode = "变更前确认", withDialog = false, stayDisabled = false } = {}) {
   let mode = initialMode;
@@ -321,4 +321,43 @@ test("waitForNewTaskComposer waits for workspace + mode triggers and waitForSend
   const ready = await waitForSendEnabled(sendCdp, { timeout: 2000, interval: 5, nudgeAfterMs: 15 });
   assert.equal(ready, true);
   assert.equal(nudged, true);
+});
+
+test("readComposerSendError detects visible SEND_FAILED banners and ignores hidden or benign alerts", async () => {
+  const makeBannerCdp = ({ coded = [], alerts = [] }) => ({
+    async evaluate(expression) {
+      return runInNewContext(expression, {
+        document: {
+          querySelectorAll(sel) {
+            if (sel === "[data-error-code]") return coded;
+            if (sel === "[role=alert]") return alerts;
+            return [];
+          },
+        },
+      });
+    },
+  });
+  const el = ({ w = 100, h = 24, code = null, text = "" } = {}) => ({
+    innerText: text,
+    getBoundingClientRect: () => ({ width: w, height: h }),
+    getAttribute: (k) => (k === "data-error-code" ? code : null),
+  });
+
+  // Visible SEND_FAILED banner (e.g. Electron draft session stalled)
+  const hit = await readComposerSendError(
+    makeBannerCdp({ coded: [el({ code: "SEND_FAILED", text: "发送失败，请稍后重试。\n草稿会话尚未开始创建" })] }),
+  );
+  assert.deepEqual({ ...hit }, { code: "SEND_FAILED", text: "发送失败，请稍后重试。 草稿会话尚未开始创建" });
+
+  // Hidden banner (width=0) -> null
+  assert.equal(await readComposerSendError(makeBannerCdp({ coded: [el({ w: 0, h: 0, code: "SEND_FAILED", text: "hidden" })] })), null);
+
+  // Visible [role=alert] with send-failure text -> detected
+  const alertHit = await readComposerSendError(
+    makeBannerCdp({ alerts: [el({ text: "发送失败：草稿会话尚未开始创建" })] }),
+  );
+  assert.equal(alertHit.code, "SEND_FAILED");
+
+  // Unrelated benign alert -> ignored
+  assert.equal(await readComposerSendError(makeBannerCdp({ alerts: [el({ text: "Copied to clipboard" })] })), null);
 });

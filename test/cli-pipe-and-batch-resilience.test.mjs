@@ -817,3 +817,88 @@ test("batch retries transient concurrency_limit (429/3008) with backoff, preserv
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("batch halts with restart_zcode_ui breaker after consecutive submission failures and distinguishes non-auth dialogs", async () => {
+  assert.deepEqual(
+    classifyBlocker("submission_circuit_breaker", "Halted after 3 consecutive submission failures (last: ZCode UI rejected send (SEND_FAILED): 草稿会话尚未开始创建)"),
+    { retryable: true, recommendedAction: "restart_zcode_ui" },
+  );
+  assert.deepEqual(
+    classifyBlocker("submission_circuit_breaker", "Halted after 3 consecutive submission failures (last: The send button was clicked, but no matching new session was found in ZCode's database.)"),
+    { retryable: true, recommendedAction: "restart_zcode_ui" },
+  );
+  assert.deepEqual(
+    classifyBlocker("submission_circuit_breaker", "A ZCode dialog is open; inspect it before submitting tasks."),
+    { retryable: false, recommendedAction: "inspect_dialog" },
+  );
+  assert.deepEqual(
+    classifyBlocker("submission_circuit_breaker", "Halted after 3 consecutive submission failures (last: cli spawn EAGAIN)"),
+    { retryable: true, recommendedAction: "inspect_backend" },
+  );
+
+  const stateDir = makeTempDir("consec-sub-breaker-");
+  try {
+    // 5 microbatch chunks (10 items), all failing submission with SEND_FAILED -> MUST trip breaker at chunk #3, leaving items 7..10 untouched pending!
+    let calls = 0;
+    const res = await runStructuredBatch({
+      batchId: "send-failed-halt",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      provider: "account:bigmodel-start-plan",
+      microbatchSize: 2,
+      maxConcurrency: 1,
+      maxRetries: 0,
+      maxConsecutiveSubmissionErrors: 3,
+      items: Array.from({ length: 10 }, (_, i) => ({ itemId: `p${i + 1}`, input: { expected: [1] } })),
+      stateDir,
+      runner: async () => {
+        calls++;
+        throw new Error("ZCode UI rejected send (SEND_FAILED): 发送失败，请稍后重试。草稿会话尚未开始创建. Restart ZCode if this persists.");
+      },
+      evaluator: async () => ({ status: "pending", structuredStatus: "pending" }),
+      sleeper: async () => {},
+    });
+    assert.equal(res.status, "blocked");
+    assert.equal(res.blocked.code, "submission_circuit_breaker");
+    assert.equal(res.blocked.retryable, true);
+    assert.equal(res.blocked.recommendedAction, "restart_zcode_ui");
+    assert.equal(res.blocked.consecutiveSubmissionErrors, 3);
+    assert.equal(calls, 3); // Halted immediately after 3 chunks instead of burning all 5!
+    assert.equal(res.counts.pending, 4); // Remaining 4 items preserved cleanly as pending
+    assert.equal(res.counts.failed, 6);
+
+    // Resuming after ZCode UI restart completes ALL 10 items (including the 6 failed ones)
+    let resumedCalls = 0;
+    const resumed = await runStructuredBatch({
+      batchId: "send-failed-halt",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      provider: "account:bigmodel-start-plan",
+      microbatchSize: 2,
+      maxConcurrency: 1,
+      maxRetries: 0,
+      items: Array.from({ length: 10 }, (_, i) => ({ itemId: `p${i + 1}`, input: { expected: [1] } })),
+      stateDir,
+      runner: async ({ input }) => ({ taskId: `session_ok_${++resumedCalls}_${input.items.map((x) => x.itemId).join(",")}` }),
+      evaluator: async (taskId, mbInput) => ({
+        taskId,
+        status: "completed",
+        structuredStatus: "valid",
+        value: {
+          results: mbInput.items.map((it) => ({
+            itemId: it.itemId,
+            output: { labels: [{ i: 1, level: 1, role: "title", conf: 1 }] },
+          })),
+        },
+        model: { providerId: "account:bigmodel-start-plan", modelId: "GLM-5.3-Flash" },
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, toolCalls: 0, modelRequests: 1 },
+      }),
+      sleeper: async () => {},
+    });
+    assert.equal(resumed.status, "completed");
+    assert.equal(resumed.counts.valid, 10);
+    assert.equal(resumedCalls, 5);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

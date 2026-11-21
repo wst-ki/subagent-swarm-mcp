@@ -135,11 +135,25 @@ export function classifyBlocker(code, message = '') {
       if (/quota|rate.limit|429|额度|限流/i.test(String(message ?? ''))) {
         return { retryable: true, recommendedAction: 'cooldown_quota' };
       }
+      if (/SEND_FAILED|草稿会话|draft session|no matching new session|ZCode UI rejected send/i.test(String(message ?? ''))) {
+        return { retryable: true, recommendedAction: 'restart_zcode_ui' };
+      }
+      if (/consecutive submission failures/i.test(String(message ?? ''))) {
+        return {
+          retryable: true,
+          recommendedAction: /zcode|v4-composer|composer-workspace|chat-mode-select/i.test(String(message ?? ''))
+            ? 'restart_zcode_ui'
+            : 'inspect_backend',
+        };
+      }
       if (/blocked by another element|open dialog or overlay|menu or popover|popover stayed open/i.test(String(message ?? ''))) {
         return { retryable: true, recommendedAction: 'dismiss_ui_overlay' };
       }
       if (/switch to model|billing route|ZCODE_MCP_PROVIDERS|provider.*not enabled/i.test(String(message ?? ''))) {
         return { retryable: false, recommendedAction: 'check_billing_route' };
+      }
+      if (/A ZCode dialog is open|dialog_open/i.test(String(message ?? ''))) {
+        return { retryable: false, recommendedAction: 'inspect_dialog' };
       }
       return { retryable: false, recommendedAction: 'needs_human_auth' };
     default:
@@ -335,6 +349,7 @@ export async function runStructuredBatch({
   maxRetries = 1,
   maxConcurrencyRetries = 3,
   concurrencyRetryDelayMs = 3000,
+  maxConsecutiveSubmissionErrors = 3,
   pollIntervalMs = undefined,
   maxPollIntervalMs = 5000,
   itemTimeoutMs = 180_000,
@@ -659,6 +674,7 @@ export async function runStructuredBatch({
 
   const chunks = packChunks(pendingItems, { microbatchSize, maxBatchInputChars });
   let cursor = 0;
+  let consecutiveSubmissionErrors = 0;
 
   async function processSingleItem(normItem) {
     let startAttempt = normItem.startAttempt ?? 1;
@@ -682,6 +698,7 @@ export async function runStructuredBatch({
           schema,
           domainRule: domainRule ?? undefined,
         }, submittedRoute));
+        consecutiveSubmissionErrors = 0;
       } catch (err) {
         if (err?.abortedByBlocker) return;
         const msg = String(err?.message ?? err);
@@ -700,7 +717,13 @@ export async function runStructuredBatch({
         const isAuthOrBlocker =
           !isCapacityExhausted &&
           /login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
-        const failureKind = isCapacityExhausted ? 'capacity_exhausted' : isAuthOrBlocker ? 'circuit_breaker' : 'submission_error';
+        if (!isCapacityExhausted) consecutiveSubmissionErrors++;
+        const hitConsecutiveLimit =
+          !isCapacityExhausted &&
+          maxConsecutiveSubmissionErrors > 0 &&
+          consecutiveSubmissionErrors >= maxConsecutiveSubmissionErrors;
+        const shouldBreak = isAuthOrBlocker || hitConsecutiveLimit;
+        const failureKind = isCapacityExhausted ? 'capacity_exhausted' : shouldBreak ? 'circuit_breaker' : 'submission_error';
         const rec = {
           itemId: normItem.itemId,
           itemKey: normItem.itemKey,
@@ -716,8 +739,15 @@ export async function runStructuredBatch({
         latestByKey.set(normItem.itemKey, rec);
         if (isCapacityExhausted) {
           stopWithBlocker('capacity_exhausted', msg, { itemId: normItem.itemId, attempt });
-        } else if (isAuthOrBlocker) {
-          stopWithBlocker('submission_circuit_breaker', msg, { itemId: normItem.itemId, attempt });
+        } else if (shouldBreak) {
+          const breakerMsg = isAuthOrBlocker
+            ? msg
+            : `Halted after ${consecutiveSubmissionErrors} consecutive submission failures (last: ${msg})`;
+          stopWithBlocker('submission_circuit_breaker', breakerMsg, {
+            itemId: normItem.itemId,
+            attempt,
+            ...(hitConsecutiveLimit ? { consecutiveSubmissionErrors } : {}),
+          });
         }
         return;
       }
@@ -909,6 +939,7 @@ export async function runStructuredBatch({
           input: mbInput,
           schema: mbSchema,
         }, submittedRoute));
+        consecutiveSubmissionErrors = 0;
       } catch (err) {
         if (err?.abortedByBlocker) return;
         const msg = String(err?.message ?? err);
@@ -927,7 +958,13 @@ export async function runStructuredBatch({
         const isAuthOrBlocker =
           !isCapacityExhausted &&
           /login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
-        const failureKind = isCapacityExhausted ? 'capacity_exhausted' : isAuthOrBlocker ? 'circuit_breaker' : 'submission_error';
+        if (!isCapacityExhausted) consecutiveSubmissionErrors++;
+        const hitConsecutiveLimit =
+          !isCapacityExhausted &&
+          maxConsecutiveSubmissionErrors > 0 &&
+          consecutiveSubmissionErrors >= maxConsecutiveSubmissionErrors;
+        const shouldBreak = isAuthOrBlocker || hitConsecutiveLimit;
+        const failureKind = isCapacityExhausted ? 'capacity_exhausted' : shouldBreak ? 'circuit_breaker' : 'submission_error';
         for (const it of remaining) {
           const rec = {
             itemId: it.itemId,
@@ -945,8 +982,15 @@ export async function runStructuredBatch({
         }
         if (isCapacityExhausted) {
           stopWithBlocker('capacity_exhausted', msg, { itemId: remaining[0].itemId, attempt });
-        } else if (isAuthOrBlocker) {
-          stopWithBlocker('submission_circuit_breaker', msg, { itemId: remaining[0].itemId, attempt });
+        } else if (shouldBreak) {
+          const breakerMsg = isAuthOrBlocker
+            ? msg
+            : `Halted after ${consecutiveSubmissionErrors} consecutive submission failures (last: ${msg})`;
+          stopWithBlocker('submission_circuit_breaker', breakerMsg, {
+            itemId: remaining[0].itemId,
+            attempt,
+            ...(hitConsecutiveLimit ? { consecutiveSubmissionErrors } : {}),
+          });
         }
         return;
       }

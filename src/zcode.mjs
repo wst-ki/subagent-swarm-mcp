@@ -380,6 +380,33 @@ export async function waitForSendEnabled(cdp, { timeout = 5000, interval = 100, 
   );
 }
 
+/**
+ * Detect an inline composer error banner (such as ZCode's `[data-error-code="SEND_FAILED"]` with
+ * "发送失败，请稍后重试。草稿会话尚未开始创建" when Electron's draft-session state machine stalls).
+ * Returns `{ code, text }` when visible, or `null`.
+ */
+export async function readComposerSendError(cdp) {
+  return cdp.evaluate(`(() => {
+    const visible = (e) => { if (!e) return false; const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const qsa = (s) => typeof document.querySelectorAll === 'function' ? [...document.querySelectorAll(s)] : [];
+    const coded = qsa('[data-error-code]').find(visible);
+    if (coded) {
+      return {
+        code: coded.getAttribute('data-error-code') || 'UI_ERROR',
+        text: (coded.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 240),
+      };
+    }
+    const alert = qsa('[role=alert]').find(e => visible(e) && /SEND_FAILED|发送失败|草稿会话|创建会话失败|failed to send|draft session/i.test(e.innerText || ''));
+    if (alert) {
+      return {
+        code: 'SEND_FAILED',
+        text: (alert.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 240),
+      };
+    }
+    return null;
+  })()`);
+}
+
 function assertCapacity() {
   const running = runningSessions();
   if (running.length >= config.maxRunning)
@@ -460,12 +487,25 @@ export async function runTask({ prompt, model, provider }) {
                   );
                 }
                 await sleep(300);
+                return null;
+              }
+              if (Date.now() - t0 >= 1200) {
+                const sendErr = await readComposerSendError(cdp).catch(() => null);
+                if (sendErr) {
+                  const err = new Error(
+                    `ZCode UI rejected send (${sendErr.code}): ${sendErr.text || "send failed"}. Restart ZCode if this persists.`,
+                  );
+                  err.sendErrorCode = sendErr.code;
+                  throw err;
+                }
               }
               return null;
             },
             { timeout: 30_000, interval: 400, what: "ZCode to create the session" },
           );
-        } catch {
+        } catch (err) {
+          await clearComposer(cdp).catch(() => {});
+          if (err?.sendErrorCode) throw err;
           throw new Error("The send button was clicked, but no matching new session was found in ZCode's database. The outcome is uncertain; inspect the composer and zcode_list before retrying to avoid duplicates.");
         }
         const row = sessionRow(sid);
@@ -502,17 +542,40 @@ export async function followUp({ taskId, prompt }) {
         await setMode(cdp);
         await typePrompt(cdp, prompt);
         const before = (tailer.refresh(), tailer.sessions.get(taskId)?.turns.size ?? 0);
+        const t0 = Date.now();
         try {
+          await waitForSendEnabled(cdp);
           await cdp.clickTestId("v4-composer-send");
         } catch (e) {
           await clearComposer(cdp);
           throw e;
         }
-        await waitFor(() => (tailer.refresh(), (tailer.sessions.get(taskId)?.turns.size ?? 0) > before), {
-          timeout: 30_000,
-          interval: 400,
-          what: "ZCode to start the follow-up turn",
-        });
+        try {
+          await waitFor(
+            async () => {
+              if ((tailer.refresh(), (tailer.sessions.get(taskId)?.turns.size ?? 0) > before)) return true;
+              if (Date.now() - t0 >= 1200) {
+                const sendErr = await readComposerSendError(cdp).catch(() => null);
+                if (sendErr) {
+                  const err = new Error(
+                    `ZCode UI rejected send (${sendErr.code}): ${sendErr.text || "send failed"}. Restart ZCode if this persists.`,
+                  );
+                  err.sendErrorCode = sendErr.code;
+                  throw err;
+                }
+              }
+              return null;
+            },
+            {
+              timeout: 30_000,
+              interval: 400,
+              what: "ZCode to start the follow-up turn",
+            },
+          );
+        } catch (err) {
+          await clearComposer(cdp).catch(() => {});
+          throw err;
+        }
         return { taskId, accepted: true };
       } finally {
         await closeOpenMenu(cdp).catch(() => {});
@@ -579,6 +642,7 @@ export async function health() {
       out.zcodeVersion = await cdp.evaluate("navigator.userAgent.match(/ZCode\\/([\\d.]+)/)?.[1] ?? null");
       out.blocker = await uiBlocker(cdp);
       out.openPopover = await menuOpen(cdp);
+      out.composerError = await readComposerSendError(cdp).catch(() => null);
       out.projectVisible = await cdp.evaluate(
         `[...document.querySelectorAll('[data-testid="virtual-project-toggle"]')].some(t => t.innerText.trim() === ${JSON.stringify(config.projectName)})`,
       );
