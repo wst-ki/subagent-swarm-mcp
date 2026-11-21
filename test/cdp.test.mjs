@@ -37,6 +37,16 @@ test("clickElement supports moveBeforeClick=false to avoid Radix submenu pointer
   assert.deepEqual(seen, ["mousePressed", "mouseReleased"]);
 });
 
+test("clickElement reports disabled / pointer-events:none instead of false overlay blocker", async () => {
+  const cdp = new Cdp();
+  cdp.evaluate = async () => ({ disabled: true, pointerEvents: "none" });
+  cdp.call = async () => assert.fail("pointer event dispatched to disabled element");
+  await assert.rejects(
+    cdp.clickTestId("v4-composer-send"),
+    /UI element is disabled or not clickable \(pointer-events: none\): v4-composer-send/,
+  );
+});
+
 test("authentication and other dialogs are reported without interaction", async () => {
   const visible = (text = "") => ({ innerText: text, getBoundingClientRect: () => ({ width: 10, height: 10 }) });
   const inspect = (dialogs, oauth = null) => uiBlocker({

@@ -96,6 +96,9 @@ export class Cdp {
       if (!e) return null;
       const r = e.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) return null;
+      const cs = typeof getComputedStyle === 'function' ? getComputedStyle(e) : null;
+      const disabled = Boolean(e.disabled) || e.getAttribute?.('aria-disabled') === 'true' || cs?.pointerEvents === 'none';
+      if (disabled) return { disabled: true, pointerEvents: cs?.pointerEvents ?? null };
       const x = r.x + r.width / 2, y = r.y + r.height / 2;
       const hit = document.elementFromPoint(x, y);
       const blocked = !hit || (hit !== e && !e.contains(hit));
@@ -108,6 +111,10 @@ export class Cdp {
       return { x, y, blocked, blocker };
     })()`);
     if (!pt) throw new Error(`UI element not found or not visible: ${what ?? elementExpr}`);
+    if (pt.disabled) {
+      const reason = pt.pointerEvents === "none" ? "pointer-events: none" : "disabled";
+      throw new Error(`UI element is disabled or not clickable (${reason}): ${what ?? elementExpr}`);
+    }
     if (pt.blocked) {
       const b = pt.blocker;
       const detail = b

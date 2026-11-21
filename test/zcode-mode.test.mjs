@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
-import { closeOpenMenu, setMode, setModel } from "../src/zcode.mjs";
+import { closeOpenMenu, setMode, setModel, waitForNewTaskComposer, waitForSendEnabled } from "../src/zcode.mjs";
 
 function makeFakeCdp({ initialMode = "变更前确认", withDialog = false, stayDisabled = false } = {}) {
   let mode = initialMode;
@@ -267,4 +267,58 @@ test("setModel uses moveBeforeClick=false for Radix provider submenu and skips r
     ),
   );
   assert.equal(switcher.isMenuOpen, false);
+});
+
+test("waitForNewTaskComposer waits for workspace + mode triggers and waitForSendEnabled waits past disabled state", async () => {
+  // Simulate transitioning from an old session (where v4-composer-input exists but workspace trigger is null)
+  // to the new-task composer on the 3rd poll.
+  let wsPoll = 0;
+  const navCdp = {
+    async evaluate(expression) {
+      wsPoll++;
+      const mounted = wsPoll >= 3;
+      const box = () => ({ width: 20, height: 20 });
+      return runInNewContext(expression, {
+        document: {
+          querySelector(sel) {
+            if (sel.includes("v4-composer-input")) return { getBoundingClientRect: box };
+            if (sel.includes("composer-workspace-trigger")) return mounted ? { getBoundingClientRect: box, innerText: "subagent" } : null;
+            if (sel.includes("chat-mode-select-trigger")) return mounted ? { getBoundingClientRect: box, innerText: "完全访问" } : null;
+            return null;
+          },
+        },
+      });
+    },
+  };
+  const project = await waitForNewTaskComposer(navCdp, { timeout: 2000, interval: 5 });
+  assert.equal(project, "subagent");
+  assert.equal(wsPoll, 3);
+
+  // Simulate v4-composer-send staying disabled:pointer-events-none until input nudge fires
+  let nudged = false;
+  const sendCdp = {
+    async evaluate(expression) {
+      if (expression.includes("dispatchEvent")) {
+        nudged = true;
+        return;
+      }
+      const btn = {
+        disabled: !nudged,
+        getBoundingClientRect: () => ({ width: 28, height: 28 }),
+        getAttribute: () => null,
+      };
+      return runInNewContext(expression, {
+        document: {
+          querySelector(sel) {
+            if (sel.includes("v4-composer-send")) return btn;
+            return null;
+          },
+        },
+        getComputedStyle: () => ({ pointerEvents: nudged ? "auto" : "none" }),
+      });
+    },
+  };
+  const ready = await waitForSendEnabled(sendCdp, { timeout: 2000, interval: 5, nudgeAfterMs: 15 });
+  assert.equal(ready, true);
+  assert.equal(nudged, true);
 });

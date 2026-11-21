@@ -29,6 +29,13 @@ test('only completed schema-valid single JSON answer succeeds', () => {
   assert.equal(check('completed','{"paper_id":"p","sections":[]}').structuredStatus,'invalid');
   assert.equal(check('completed','{"paper_id":"p","sections":[{"level":1,"title":"Introduction"}]}').structuredStatus,'valid');
   assert.equal(evaluateStructuredResult('session_x',schema,{status:'failed',error:{code:'429'}}).failureKind,'quota_or_rate_limit');
+  assert.equal(
+    evaluateStructuredResult('session_x', schema, {
+      status: 'failed',
+      error: { code: 'UNKNOWN_ERROR', causeCode: 'model_rate_limited', statusCode: 429, providerCode: '3008', message: 'user concurrency limit exceeded' },
+    }).failureKind,
+    'concurrency_limit',
+  );
   assert.equal(check('completed','x'.repeat(262145)).structuredStatus,'invalid');
 });
 test('contract is recovered from the matching session and follow-ups fail closed', () => {

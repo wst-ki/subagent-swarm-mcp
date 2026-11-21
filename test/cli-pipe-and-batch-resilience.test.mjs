@@ -691,3 +691,129 @@ test("batch fallbackProvider automatically switches from Start Plan to Personal 
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("batch retries transient concurrency_limit (429/3008) with backoff, preserves real microbatch errors, and does not circuit-break on disabled send button", async () => {
+  const stateDir = makeTempDir("conc-limit-");
+  try {
+    // Part A: Microbatch hits 429/3008 concurrency_limit twice, retries with backoff even when maxRetries=0, and succeeds on 3rd try!
+    let mbCalls = 0;
+    const sleeps = [];
+    const resRecovered = await runStructuredBatch({
+      batchId: "conc-recover-mb",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      domainRule: "section-outline-v1",
+      provider: "account:bigmodel-start-plan",
+      microbatchSize: 2,
+      maxRetries: 0,
+      maxConcurrencyRetries: 3,
+      concurrencyRetryDelayMs: 100,
+      items: [
+        { itemId: "m1", input: { expected: [1] } },
+        { itemId: "m2", input: { expected: [1] } },
+      ],
+      stateDir,
+      runner: async () => ({ taskId: `session_mb_${++mbCalls}` }),
+      evaluator: async (taskId) => {
+        if (mbCalls <= 2) {
+          return {
+            taskId,
+            status: "failed",
+            structuredStatus: "task_not_completed",
+            failureKind: "concurrency_limit",
+            error: { statusCode: 429, providerCode: "3008", message: "user concurrency limit exceeded" },
+          };
+        }
+        return {
+          taskId,
+          status: "completed",
+          structuredStatus: "valid",
+          value: {
+            results: [
+              { itemId: "m1", output: { labels: [{ i: 1, level: 1, role: "title", conf: 1 }] } },
+              { itemId: "m2", output: { labels: [{ i: 1, level: 1, role: "title", conf: 1 }] } },
+            ],
+          },
+          model: { providerId: "account:bigmodel-start-plan", modelId: "GLM-5.3-Flash" },
+          usage: { inputTokens: 20, outputTokens: 10, totalTokens: 30, toolCalls: 0, modelRequests: 1 },
+        };
+      },
+      sleeper: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    assert.equal(resRecovered.status, "completed");
+    assert.equal(resRecovered.counts.valid, 2);
+    assert.equal(mbCalls, 3);
+    assert.ok(sleeps.some((ms) => ms >= 80));
+
+    // Part B: When concurrency_limit exhausts retries, microbatch records preserve real 429/3008 error (NOT "missing itemId")
+    let exhaustedCalls = 0;
+    const resExhausted = await runStructuredBatch({
+      batchId: "conc-exhausted-mb",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      microbatchSize: 2,
+      maxRetries: 0,
+      maxConcurrencyRetries: 1,
+      concurrencyRetryDelayMs: 10,
+      items: [
+        { itemId: "u1", input: { expected: [1] } },
+        { itemId: "u2", input: { expected: [1] } },
+      ],
+      stateDir,
+      runner: async () => ({ taskId: `session_ex_${++exhaustedCalls}` }),
+      evaluator: async (taskId) => ({
+        taskId,
+        status: "failed",
+        structuredStatus: "task_not_completed",
+        failureKind: "concurrency_limit",
+        error: { statusCode: 429, providerCode: "3008", message: "user concurrency limit exceeded" },
+      }),
+      sleeper: async () => {},
+    });
+    assert.equal(resExhausted.status, "completed"); // Did NOT kill wave with circuit breaker
+    assert.equal(exhaustedCalls, 2); // 1 initial + 1 concurrency retry
+    assert.equal(resExhausted.items[0].failureKind, "concurrency_limit");
+    assert.match(resExhausted.items[0].error, /HTTP 429.*providerCode 3008.*user concurrency limit exceeded/);
+    assert.doesNotMatch(resExhausted.items[0].errors[0], /missing itemId/);
+
+    // Part C: "UI element is disabled or not clickable" does NOT trip submission_circuit_breaker (subsequent item still runs!)
+    let disabledCalls = 0;
+    const resDisabled = await runStructuredBatch({
+      batchId: "disabled-no-breaker",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      provider: "account:bigmodel-start-plan",
+      maxConcurrency: 1,
+      maxRetries: 0,
+      items: [
+        { itemId: "d1", input: { expected: [1] } },
+        { itemId: "d2", input: { expected: [1] } },
+      ],
+      stateDir,
+      runner: async () => {
+        disabledCalls++;
+        if (disabledCalls === 1) {
+          throw new Error("UI element is disabled or not clickable (pointer-events: none): v4-composer-send");
+        }
+        return { taskId: "session_d2_ok" };
+      },
+      evaluator: async (taskId) => ({
+        taskId,
+        status: "completed",
+        structuredStatus: "valid",
+        value: { labels: [{ i: 1, level: 1, role: "title", conf: 1 }] },
+        model: { providerId: "account:bigmodel-start-plan", modelId: "GLM-5.3-Flash" },
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, toolCalls: 0, modelRequests: 1 },
+      }),
+      sleeper: async () => {},
+    });
+    assert.equal(resDisabled.status, "completed");
+    assert.equal(resDisabled.counts.valid, 1);
+    assert.equal(resDisabled.counts.failed, 1);
+    assert.equal(disabledCalls, 2); // d2 was NOT aborted by circuit breaker!
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

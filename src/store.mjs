@@ -20,7 +20,60 @@ export function withDb(fn) {
 
 // ---------------------------------------------------------------- log tailer
 
-const TRACKED = new Set(["turn.started", "turn.completed", "tool.call.started", "tool.call.completed", "tool.call.failed", "model.request.started", "model.request.completed"]);
+const TRACKED = new Set([
+  "turn.started",
+  "turn.completed",
+  "turn.failed",
+  "tool.call.started",
+  "tool.call.completed",
+  "tool.call.failed",
+  "model.request.started",
+  "model.request.completed",
+  "model.request.failed",
+]);
+
+/** Extract compact, PII-free upstream error details from ZCode JSONL `turn.failed` or `model.request.failed`. */
+export function extractLogError(r) {
+  if (!r || typeof r !== "object") return null;
+  let out = {};
+  if (r.event === "turn.failed" && r.error && typeof r.error === "object") {
+    const err = r.error;
+    const cause = err.cause && typeof err.cause === "object" ? err.cause : null;
+    const cctx = cause?.context && typeof cause.context === "object" ? cause.context : null;
+    const bodyErr = cctx?.responseBodySummary?.error && typeof cctx.responseBodySummary.error === "object"
+      ? cctx.responseBodySummary.error
+      : null;
+    const innerCause = cause?.cause && typeof cause.cause === "object" ? cause.cause : null;
+    const rawMsg = cause?.message || bodyErr?.providerMessage || innerCause?.message || err.message || "";
+    out = {
+      type: err.type ?? null,
+      code: err.code ?? null,
+      causeCode: cause?.code ?? bodyErr?.code ?? innerCause?.code ?? null,
+      statusCode: cctx?.statusCode ?? cctx?.responseStatus ?? bodyErr?.responseStatus ?? null,
+      providerCode: cctx?.providerCode != null ? String(cctx.providerCode) : bodyErr?.providerCode != null ? String(bodyErr.providerCode) : null,
+      reason: cctx?.reason ?? null,
+      message: String(rawMsg).trim().slice(0, 300) || null,
+      retryable: typeof cctx?.retryable === "boolean" ? cctx.retryable : null,
+    };
+  } else if (r.event === "model.request.failed" && r.context && typeof r.context === "object") {
+    const ctx = r.context;
+    const rawMsg = ctx.statusMessage || ctx.errorMessage || ctx.error || "";
+    out = {
+      statusCode: ctx.statusCode ?? null,
+      providerCode: ctx.providerCode != null ? String(ctx.providerCode) : null,
+      reason: ctx.reason ?? null,
+      message: String(rawMsg).trim().slice(0, 300) || null,
+      retryable: typeof ctx.retryable === "boolean" ? ctx.retryable : null,
+    };
+  } else {
+    return null;
+  }
+  const compact = {};
+  for (const [k, v] of Object.entries(out)) {
+    if (v !== null && v !== undefined && v !== "") compact[k] = v;
+  }
+  return Object.keys(compact).length ? compact : null;
+}
 
 export class LogTailer {
   #dir;
@@ -88,6 +141,21 @@ export class LogTailer {
       case "turn.completed": {
         const t = s.turns.get(r.turnId) ?? { startedAt: ts };
         s.turns.set(r.turnId, { ...t, completedAt: ts, status: r.status ?? "completed" });
+        break;
+      }
+      case "turn.failed": {
+        const t = s.turns.get(r.turnId) ?? { startedAt: ts };
+        const err = extractLogError(r);
+        s.turns.set(r.turnId, { ...t, completedAt: ts, status: "failed", ...(err ? { error: err } : {}) });
+        s.tool = null;
+        if (err) s.lastTurnError = { turnId: r.turnId ?? null, at: ts, ...err };
+        break;
+      }
+      case "model.request.failed": {
+        if (!r.context?.querySource || r.context.querySource === "main_turn") {
+          const err = extractLogError(r);
+          if (err) s.lastModelError = { turnId: r.turnId ?? null, at: ts, ...err };
+        }
         break;
       }
       case "tool.call.started":
@@ -317,6 +385,31 @@ export function taskStatus(
       { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, totalTokens: 0, toolCalls: 0, modelRequests: 0 },
     );
     if (last.status === "error") out.error = { type: last.error_type, code: last.error_code };
+  }
+  if (status === "failed" || last?.status === "error") {
+    const pickErr = (e) => {
+      if (!e || typeof e !== "object") return null;
+      const { turnId: _tid, at: _at, ...rest } = e;
+      return Object.keys(rest).length ? rest : null;
+    };
+    const logErr =
+      (logNewerThanDb ? pickErr(completedViaLog?.error) : null) ??
+      (last?.turn_id ? pickErr(live?.turns?.get(last.turn_id)?.error) : null) ??
+      (last?.turn_id && live?.lastTurnError?.turnId === last.turn_id ? pickErr(live.lastTurnError) : null) ??
+      (last?.turn_id && live?.lastModelError?.turnId === last.turn_id ? pickErr(live.lastModelError) : null) ??
+      (live?.lastTurnError && live.lastTurnError.at >= startedAt - 5000 ? pickErr(live.lastTurnError) : null) ??
+      (live?.lastModelError && live.lastModelError.at >= startedAt - 5000 ? pickErr(live.lastModelError) : null);
+    if (logErr) {
+      out.error = {
+        ...logErr,
+        ...(out.error ?? {}),
+        ...(logErr.causeCode ? { causeCode: logErr.causeCode } : {}),
+        ...(logErr.statusCode != null ? { statusCode: logErr.statusCode } : {}),
+        ...(logErr.providerCode != null ? { providerCode: logErr.providerCode } : {}),
+        ...(logErr.reason ? { reason: logErr.reason } : {}),
+        ...(logErr.message ? { message: logErr.message } : {}),
+      };
+    }
   }
   return out;
 }

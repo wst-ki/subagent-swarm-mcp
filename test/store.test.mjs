@@ -164,3 +164,70 @@ test("unstarted starting session exceeding startingTimeoutSec transitions to fai
   assert.match(stExpired.note, /timed out/i);
   assert.equal(stExpired.elapsedSec, config.startingTimeoutSec);
 });
+
+test("LogTailer extracts nested turn.failed 429/3008 concurrency error and ignores background querySource failures", () => {
+  const t = new LogTailer("/nonexistent");
+  const tStart = Date.parse("2026-11-21T09:15:06.000Z");
+  const tFail = Date.parse("2026-11-21T09:15:09.000Z");
+  t.ingestLine(ev("turn.started", { sessionId: "s429", turnId: "turn_1", timestamp: "2026-11-21T09:15:06.000Z" }));
+  // Background memory/title failure must not pollute main_turn errors
+  t.ingestLine(
+    ev("model.request.failed", {
+      sessionId: "s429",
+      turnId: "turn_1",
+      timestamp: "2026-11-21T09:15:07.000Z",
+      context: { querySource: "session_title", statusCode: 429, statusMessage: "background title fail" },
+    }),
+  );
+  assert.equal(t.sessions.get("s429").lastModelError, undefined);
+
+  // Real turn.failed with nested ZCode ProviderBusinessError 3008
+  t.ingestLine(
+    ev("turn.failed", {
+      sessionId: "s429",
+      turnId: "turn_1",
+      timestamp: "2026-11-21T09:15:09.000Z",
+      error: {
+        type: "unknown_error",
+        code: "UNKNOWN_ERROR",
+        message: "Turn execution failed",
+        cause: {
+          code: "model_rate_limited",
+          message: "user concurrency limit exceeded",
+          context: { statusCode: 429, providerCode: "3008", reason: "rate_limited", retryable: false },
+        },
+      },
+    }),
+  );
+
+  // Even when SQLite turn_usage only stores UNKNOWN_ERROR, taskStatus enriches error with 429/3008 details
+  const st = taskStatus("s429", tFail + 1000, {
+    bootAt: 0,
+    tailer: t,
+    sessionRowFn: () => ({ id: "s429", title: "Concurrency fail", time_created: tStart }),
+    turnUsageRowsFn: () => [
+      {
+        turn_id: "turn_1",
+        status: "error",
+        error_type: "unknown_error",
+        error_code: "UNKNOWN_ERROR",
+        started_at: tStart,
+        completed_at: tFail,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        computed_total_tokens: 0,
+        tool_call_count: 0,
+        model_request_count: 1,
+      },
+    ],
+  });
+  assert.equal(st.status, "failed");
+  assert.equal(st.error.code, "UNKNOWN_ERROR");
+  assert.equal(st.error.causeCode, "model_rate_limited");
+  assert.equal(st.error.statusCode, 429);
+  assert.equal(st.error.providerCode, "3008");
+  assert.equal(st.error.message, "user concurrency limit exceeded");
+  assert.deepEqual(runningSessions(tFail + 1000, { bootAt: 0, tailer: t, sessionRowFn: () => ({ id: "s429", time_created: tStart }), turnUsageRowsFn: () => [] }), []);
+});

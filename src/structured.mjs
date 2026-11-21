@@ -495,12 +495,29 @@ export function structuredResult(taskId, options = {}) {
   });
 }
 
+export function classifyTaskFailure(result) {
+  if (result.status === 'running' || result.status === 'starting') return null;
+  const errObj = result.error && typeof result.error === 'object' ? result.error : null;
+  const detail = JSON.stringify(result.error ?? {});
+  const providerCode = String(errObj?.providerCode ?? '');
+  if (
+    providerCode === '3008' ||
+    /concurrency\s*limit|too many concurrent|concurrent\s*(?:request|task|limit)|并发.*(?:限制|超限|上限)/i.test(detail)
+  ) {
+    return 'concurrency_limit';
+  }
+  if (/quota|rate.limit|model_rate_limited|429|额度|限流|insufficient|balance/i.test(detail)) {
+    return 'quota_or_rate_limit';
+  }
+  if (result.status === 'cancelled') return 'cancelled';
+  return 'task_failed_or_unknown';
+}
+
 export function evaluateStructuredResult(taskId, schema, result, options = {}) {
   const backendMeta = result.backend ? { backend: result.backend } : {};
   if (result.status !== 'completed') {
     const pending = result.status === 'running' || result.status === 'starting';
-    const detail = JSON.stringify(result.error ?? {});
-    const failureKind = pending ? null : /quota|rate.limit|429|额度|限流/i.test(detail) ? 'quota_or_rate_limit' : result.status === 'cancelled' ? 'cancelled' : 'task_failed_or_unknown';
+    const failureKind = classifyTaskFailure(result);
     return { ...result, protocol: 'zcode-structured-v1', structuredStatus: pending ? 'pending' : 'task_not_completed', failureKind, retryPerformed: false };
   }
   const text = (result.result ?? '').trim();

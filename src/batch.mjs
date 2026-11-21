@@ -99,10 +99,32 @@ export function isCapacityOrLockBusyError(message) {
   );
 }
 
+export function formatTaskError(evalRes) {
+  if (!evalRes || typeof evalRes !== 'object') return 'task failed with unknown error';
+  const taskId = evalRes.taskId ? `Task ${evalRes.taskId}` : 'Task';
+  const err = evalRes.error;
+  if (typeof err === 'string' && err.trim()) return `${taskId} failed: ${err.trim()}`;
+  if (err && typeof err === 'object') {
+    const parts = [];
+    if (err.statusCode != null) parts.push(`HTTP ${err.statusCode}`);
+    if (err.providerCode != null) parts.push(`providerCode ${err.providerCode}`);
+    if (err.causeCode && err.causeCode !== err.code) parts.push(err.causeCode);
+    else if (err.code) parts.push(err.code);
+    const prefix = parts.length ? `${parts.join(' / ')}: ` : '';
+    const msg = err.message || err.reason || err.type || '';
+    if (msg) return `${taskId} failed (${prefix}${msg})`;
+    if (parts.length) return `${taskId} failed (${parts.join(' / ')})`;
+  }
+  if (evalRes.note) return `${taskId} failed: ${evalRes.note}`;
+  return `${taskId} did not complete (status=${evalRes.status ?? 'unknown'})`;
+}
+
 export function classifyBlocker(code, message = '') {
   switch (code) {
     case 'quota_or_rate_limit':
       return { retryable: true, recommendedAction: 'cooldown_quota' };
+    case 'concurrency_limit':
+      return { retryable: true, recommendedAction: 'reduce_concurrency' };
     case 'capacity_exhausted':
       return { retryable: true, recommendedAction: 'wait_capacity' };
     case 'credit_budget_reached':
@@ -227,7 +249,8 @@ export function readBatchStatus(batchId, { stateDir = config.stateDir, includeIt
           failureKind: rec.failureKind ?? null,
           attempt: rec.attempt ?? 1,
           elapsedMs: rec.elapsedMs ?? null,
-          errors: rec.errors ?? undefined,
+          ...(rec.error ? { error: rec.error } : {}),
+          errors: rec.errors ?? (rec.error ? [rec.error] : undefined),
           value: rec.value ?? undefined,
           model: rec.model ?? undefined,
         });
@@ -310,6 +333,8 @@ export async function runStructuredBatch({
   reserveSlots = 0,
   maxCredit = null,
   maxRetries = 1,
+  maxConcurrencyRetries = 3,
+  concurrencyRetryDelayMs = 3000,
   pollIntervalMs = undefined,
   maxPollIntervalMs = 5000,
   itemTimeoutMs = 180_000,
@@ -556,7 +581,7 @@ export async function runStructuredBatch({
     if (prev.structuredStatus === 'invalid' && (prev.attempt ?? 1) <= maxRetries) {
       return { eligible: true, startAttempt: (prev.attempt ?? 1) + 1, lastErrors: prev.errors ?? ['previous attempt invalid'] };
     }
-    if (['submission_error', 'circuit_breaker', 'quota_or_rate_limit', 'capacity_exhausted'].includes(prev.failureKind)) {
+    if (['submission_error', 'circuit_breaker', 'quota_or_rate_limit', 'concurrency_limit', 'capacity_exhausted'].includes(prev.failureKind)) {
       return { eligible: true, startAttempt: 1, lastErrors: null };
     }
     if (prev.failureKind === 'timeout' && (prev.attempt ?? 1) <= maxRetries) {
@@ -639,6 +664,7 @@ export async function runStructuredBatch({
     let startAttempt = normItem.startAttempt ?? 1;
     let lastErrors = normItem.lastErrors ?? null;
     let didProviderFallback = false;
+    let concurrencyRetries = 0;
 
     for (let attempt = startAttempt; attempt <= maxRetries + 1; attempt++) {
       if (blockedReason) return;
@@ -671,7 +697,9 @@ export async function runStructuredBatch({
           attempt--;
           continue;
         }
-        const isAuthOrBlocker = !isCapacityExhausted && /login|expired|sign in|dialog|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
+        const isAuthOrBlocker =
+          !isCapacityExhausted &&
+          /login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
         const failureKind = isCapacityExhausted ? 'capacity_exhausted' : isAuthOrBlocker ? 'circuit_breaker' : 'submission_error';
         const rec = {
           itemId: normItem.itemId,
@@ -764,6 +792,31 @@ export async function runStructuredBatch({
         return;
       }
 
+      if (evalRes.failureKind === 'concurrency_limit') {
+        trackTaskUsage(started.taskId, evalRes.usage);
+        if (concurrencyRetries < maxConcurrencyRetries && !blockedReason) {
+          concurrencyRetries++;
+          const baseDelay = Math.min(20_000, concurrencyRetryDelayMs * (2 ** (concurrencyRetries - 1)));
+          const delayMs = Math.max(0, Math.round(baseDelay * (0.85 + Math.random() * 0.3)));
+          await sleeper(delayMs);
+          attempt--;
+          continue;
+        }
+        if (
+          !didProviderFallback &&
+          tryActivateFallbackProvider(submittedRoute, formatTaskError(evalRes), {
+            itemId: normItem.itemId,
+            taskId: started.taskId,
+          })
+        ) {
+          didProviderFallback = true;
+          concurrencyRetries = 0;
+          attempt--;
+          continue;
+        }
+      }
+
+      const taskErrorText = evalRes.structuredStatus === 'task_not_completed' ? formatTaskError(evalRes) : undefined;
       const rec = {
         itemId: normItem.itemId,
         itemKey: normItem.itemKey,
@@ -771,7 +824,8 @@ export async function runStructuredBatch({
         taskId: started.taskId,
         structuredStatus: evalRes.structuredStatus,
         failureKind: evalRes.failureKind ?? null,
-        errors: evalRes.errors ?? undefined,
+        ...(taskErrorText ? { error: taskErrorText } : {}),
+        errors: evalRes.errors ?? (taskErrorText ? [taskErrorText] : undefined),
         value: evalRes.value ?? undefined,
         model: evalRes.model ?? null,
         usage: evalRes.usage ?? null,
@@ -786,7 +840,7 @@ export async function runStructuredBatch({
       if (evalRes.failureKind === 'quota_or_rate_limit') {
         if (
           !didProviderFallback &&
-          tryActivateFallbackProvider(submittedRoute, `Task ${started.taskId} hit quota or rate limit`, {
+          tryActivateFallbackProvider(submittedRoute, formatTaskError(evalRes), {
             itemId: normItem.itemId,
             taskId: started.taskId,
           })
@@ -795,7 +849,7 @@ export async function runStructuredBatch({
           attempt--;
           continue;
         }
-        stopWithBlocker('quota_or_rate_limit', `Task ${started.taskId} hit quota or rate limit`, {
+        stopWithBlocker('quota_or_rate_limit', formatTaskError(evalRes), {
           itemId: normItem.itemId,
           taskId: started.taskId,
           error: evalRes.error ?? null,
@@ -823,6 +877,7 @@ export async function runStructuredBatch({
     let remaining = [...chunkItems];
     let lastBatchErrors = [];
     let didProviderFallback = false;
+    let concurrencyRetries = 0;
 
     for (let attempt = 1; attempt <= maxRetries + 1 && remaining.length > 0; attempt++) {
       if (blockedReason) return;
@@ -869,7 +924,9 @@ export async function runStructuredBatch({
           attempt--;
           continue;
         }
-        const isAuthOrBlocker = !isCapacityExhausted && /login|expired|sign in|dialog|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
+        const isAuthOrBlocker =
+          !isCapacityExhausted &&
+          /login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
         const failureKind = isCapacityExhausted ? 'capacity_exhausted' : isAuthOrBlocker ? 'circuit_breaker' : 'submission_error';
         for (const it of remaining) {
           const rec = {
@@ -971,10 +1028,34 @@ export async function runStructuredBatch({
         return;
       }
 
+      if (evalRes.failureKind === 'concurrency_limit') {
+        trackTaskUsage(started.taskId, evalRes.usage);
+        if (concurrencyRetries < maxConcurrencyRetries && !blockedReason) {
+          concurrencyRetries++;
+          const baseDelay = Math.min(20_000, concurrencyRetryDelayMs * (2 ** (concurrencyRetries - 1)));
+          const delayMs = Math.max(0, Math.round(baseDelay * (0.85 + Math.random() * 0.3)));
+          await sleeper(delayMs);
+          attempt--;
+          continue;
+        }
+        if (
+          !didProviderFallback &&
+          tryActivateFallbackProvider(submittedRoute, formatTaskError(evalRes), {
+            itemId: remaining[0].itemId,
+            taskId: started.taskId,
+          })
+        ) {
+          didProviderFallback = true;
+          concurrencyRetries = 0;
+          attempt--;
+          continue;
+        }
+      }
+
       if (evalRes.failureKind === 'quota_or_rate_limit') {
         if (
           !didProviderFallback &&
-          tryActivateFallbackProvider(submittedRoute, `Task ${started.taskId} hit quota or rate limit`, {
+          tryActivateFallbackProvider(submittedRoute, formatTaskError(evalRes), {
             itemId: remaining[0].itemId,
             taskId: started.taskId,
           })
@@ -983,6 +1064,7 @@ export async function runStructuredBatch({
           attempt--;
           continue;
         }
+        const quotaErr = formatTaskError(evalRes);
         for (const it of remaining) {
           const rec = {
             itemId: it.itemId,
@@ -991,13 +1073,15 @@ export async function runStructuredBatch({
             taskId: started.taskId,
             structuredStatus: 'task_not_completed',
             failureKind: 'quota_or_rate_limit',
+            error: quotaErr,
+            errors: [quotaErr],
             elapsedMs,
             at: new Date().toISOString(),
           };
           appendFileSync(resultsPath, JSON.stringify(rec) + '\n', 'utf8');
           latestByKey.set(it.itemKey, rec);
         }
-        stopWithBlocker('quota_or_rate_limit', `Task ${started.taskId} hit quota or rate limit`, {
+        stopWithBlocker('quota_or_rate_limit', quotaErr, {
           itemId: remaining[0].itemId,
           taskId: started.taskId,
           error: evalRes.error ?? null,
@@ -1006,7 +1090,9 @@ export async function runStructuredBatch({
       }
 
       // Unpack per-item results and perform per-item schema + domainRule validation (partial-batch recovery!)
-      const rawResults = Array.isArray(evalRes.value?.results) ? evalRes.value.results : [];
+      const isTaskNotCompleted = evalRes.structuredStatus === 'task_not_completed';
+      const taskErrorText = isTaskNotCompleted ? formatTaskError(evalRes) : null;
+      const rawResults = !isTaskNotCompleted && Array.isArray(evalRes.value?.results) ? evalRes.value.results : [];
       const byItemId = new Map();
       for (const entry of rawResults) {
         if (entry && typeof entry.itemId === 'string' && !byItemId.has(entry.itemId)) {
@@ -1020,7 +1106,9 @@ export async function runStructuredBatch({
       for (const it of remaining) {
         const itemOutput = byItemId.get(it.itemId);
         let itemErrors = [];
-        if (itemOutput === undefined) {
+        if (isTaskNotCompleted) {
+          itemErrors = [taskErrorText];
+        } else if (itemOutput === undefined) {
           itemErrors = evalRes.errors?.length
             ? evalRes.errors
             : [`missing itemId "${it.itemId}" in microbatch results`];
@@ -1037,8 +1125,9 @@ export async function runStructuredBatch({
           itemKey: it.itemKey,
           attempt,
           taskId: started.taskId,
-          structuredStatus: isValid ? 'valid' : evalRes.structuredStatus === 'task_not_completed' ? 'task_not_completed' : 'invalid',
+          structuredStatus: isValid ? 'valid' : isTaskNotCompleted ? 'task_not_completed' : 'invalid',
           failureKind: evalRes.failureKind ?? null,
+          ...(isTaskNotCompleted && taskErrorText ? { error: taskErrorText } : {}),
           ...(isValid ? { value: itemOutput } : { errors: itemErrors }),
           model: evalRes.model ?? null,
           usage: evalRes.usage ?? null,

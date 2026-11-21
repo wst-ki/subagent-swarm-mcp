@@ -121,7 +121,16 @@ async function ensureWorkspace(cdp) {
 /** Switch the composer mode to FULL_ACCESS ("完全访问"), handling 3.18.2's risk confirmation dialog if shown. */
 export async function setMode(cdp) {
   const label = () => cdp.evaluate(`document.querySelector('[data-testid="chat-mode-select-trigger"]')?.innerText.trim()`);
-  if ((await label()) === FULL_ACCESS) return;
+  const initial = await label();
+  if (initial === FULL_ACCESS) return;
+  if (!initial) {
+    await waitFor(() => cdp.hasTestId("chat-mode-select-trigger"), {
+      timeout: 3000,
+      interval: 100,
+      what: "chat-mode-select-trigger",
+    });
+    if ((await label()) === FULL_ACCESS) return;
+  }
   try {
     await cdp.clickTestId("chat-mode-select-trigger");
     await sleep(400);
@@ -295,9 +304,80 @@ async function typePrompt(cdp, prompt) {
 }
 
 async function clearComposer(cdp) {
-  await cdp
-    .evaluate(`(() => { const e = document.querySelector('[data-testid="v4-composer-input"]'); if (e) { e.focus(); const range = document.createRange(); range.selectNodeContents(e); const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range); document.execCommand('delete'); } })()`)
-    .catch(() => {});
+  try {
+    await cdp
+      .evaluate(`(() => { const e = document.querySelector('[data-testid="v4-composer-input"]'); if (e) { e.focus(); const range = document.createRange(); range.selectNodeContents(e); const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range); } })()`)
+      .catch(() => {});
+    if (typeof cdp.call === "function") {
+      // Lexical/ProseMirror composers ignore document.execCommand('delete'); real Ctrl+A + Backspace clears reliably.
+      for (const type of ["keyDown", "keyUp"]) {
+        await cdp
+          .call("Input.dispatchKeyEvent", { type, modifiers: 2, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 })
+          .catch(() => {});
+      }
+      await sleep(30);
+      for (const type of ["keyDown", "keyUp"]) {
+        await cdp
+          .call("Input.dispatchKeyEvent", { type, key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 })
+          .catch(() => {});
+      }
+    } else {
+      await cdp.evaluate(`document.execCommand('delete')`).catch(() => {});
+    }
+  } catch {}
+}
+
+/**
+ * Wait until ZCode finishes transitioning from an existing task view to a fresh "new task" composer.
+ * An existing session page already renders `v4-composer-input` without `composer-workspace-trigger`,
+ * so waiting on `v4-composer-input` alone can resolve immediately on the old view and read
+ * `composer-workspace-trigger` as `undefined` or miss `chat-mode-select-trigger`.
+ */
+export async function waitForNewTaskComposer(cdp, { timeout = 6000, interval = 150 } = {}) {
+  return waitFor(
+    async () =>
+      cdp.evaluate(`(() => {
+        const visible = (e) => { if (!e) return false; const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+        const input = document.querySelector('[data-testid="v4-composer-input"]');
+        const ws = document.querySelector('[data-testid="composer-workspace-trigger"]');
+        const mode = document.querySelector('[data-testid="chat-mode-select-trigger"]');
+        if (!visible(input) || !visible(ws) || !visible(mode)) return null;
+        const project = (ws.innerText || '').trim();
+        return project || null;
+      })()`),
+    { timeout, interval, what: "new task composer (workspace + mode triggers)" },
+  );
+}
+
+/**
+ * Wait until `v4-composer-send` leaves its `disabled:pointer-events-none` state after a large paste.
+ * Dispatches one benign bubbling `input` event on `v4-composer-input` if React/Lexical has not
+ * flushed the enabled state after `nudgeAfterMs`.
+ */
+export async function waitForSendEnabled(cdp, { timeout = 5000, interval = 100, nudgeAfterMs = 1500 } = {}) {
+  let nudged = false;
+  const started = Date.now();
+  return waitFor(
+    async () => {
+      const ready = await cdp.evaluate(`(() => {
+        const e = document.querySelector('[data-testid="v4-composer-send"]');
+        if (!e) return false;
+        const r = e.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const cs = typeof getComputedStyle === 'function' ? getComputedStyle(e) : null;
+        return !e.disabled && e.getAttribute('aria-disabled') !== 'true' && cs?.pointerEvents !== 'none';
+      })()`);
+      if (ready) return true;
+      if (!nudged && Date.now() - started >= nudgeAfterMs) {
+        nudged = true;
+        await cdp
+          .evaluate(`(() => { const i = document.querySelector('[data-testid="v4-composer-input"]'); if (i) i.dispatchEvent(new Event('input', { bubbles: true })); })()`)
+          .catch(() => {});
+      }
+      return null;
+    },
+    { timeout, interval, what: "v4-composer-send button to become enabled" },
+  );
 }
 
 function assertCapacity() {
@@ -335,9 +415,16 @@ export async function runTask({ prompt, model, provider }) {
             throw err;
           }
         }
-        await waitFor(() => cdp.hasTestId("v4-composer-input"), { what: "new task composer" });
-        await sleep(400);
-        const project = await cdp.evaluate(`document.querySelector('[data-testid="composer-workspace-trigger"]')?.innerText.trim()`);
+        let project;
+        try {
+          project = await waitForNewTaskComposer(cdp, { timeout: 3500 });
+        } catch {
+          // A sidebar re-render during high load can swallow the first click; retry once if no dialog blocks.
+          if (await uiBlocker(cdp)) throw new ZcodeUnavailableError((await uiBlocker(cdp)).message);
+          await closeOpenMenu(cdp).catch(() => {});
+          await cdp.clickElement(createTaskExpr, createTaskLabel);
+          project = await waitForNewTaskComposer(cdp, { timeout: 6000 });
+        }
         if (project !== config.projectName)
           throw new Error(`New task opened in project "${project}", expected "${config.projectName}". Refusing to send.`);
 
@@ -347,6 +434,7 @@ export async function runTask({ prompt, model, provider }) {
 
         const t0 = Date.now();
         try {
+          await waitForSendEnabled(cdp);
           await cdp.clickTestId("v4-composer-send");
         } catch (e) {
           await clearComposer(cdp);
