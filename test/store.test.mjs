@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { LogTailer, runningSessions, taskStatus } from "../src/store.mjs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { LogTailer, findSessionByPromptInDb, runningSessions, taskStatus } from "../src/store.mjs";
 import { config } from "../src/config.mjs";
 
 const ev = (event, extra = {}) =>
@@ -230,4 +234,88 @@ test("LogTailer extracts nested turn.failed 429/3008 concurrency error and ignor
   assert.equal(st.error.providerCode, "3008");
   assert.equal(st.error.message, "user concurrency limit exceeded");
   assert.deepEqual(runningSessions(tFail + 1000, { bootAt: 0, tailer: t, sessionRowFn: () => ({ id: "s429", time_created: tStart }), turnUsageRowsFn: () => [] }), []);
+});
+
+test("LogTailer.refresh reads logs in bounded chunks across multi-byte UTF-8 boundaries and handles truncation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "zcode-logtail-chunk-"));
+  try {
+    const logPath = join(dir, "zcode-2026-11-22.jsonl");
+    const line1 = ev("turn.started", { sessionId: "s_utf8", turnId: "t1", note: "中文日志内容测试".repeat(6) });
+    const line2 = ev("turn.completed", { sessionId: "s_utf8", turnId: "t1", status: "completed", timestamp: "2026-10-19T10:00:05.000Z" });
+    // Write line1 + partial line2 (split mid-UTF-8/JSON), refresh in tiny 48-byte chunks, then append rest.
+    const splitAt = Math.floor(line2.length / 2);
+    writeFileSync(logPath, line1 + "\n" + line2.slice(0, splitAt), "utf8");
+
+    const t = new LogTailer(dir);
+    t.refresh({ chunkBytes: 48 });
+    assert.equal(t.sessions.get("s_utf8").turns.get("t1").completedAt, null);
+
+    appendFileSync(logPath, line2.slice(splitAt) + "\n", "utf8");
+    t.refresh({ chunkBytes: 48 });
+    assert.equal(t.sessions.get("s_utf8").turns.get("t1").status, "completed");
+
+    // Truncate/rotate file -> resets offset AND stale carry buffer cleanly.
+    const line3 = ev("turn.started", { sessionId: "s_rot", turnId: "t2" });
+    writeFileSync(logPath, line3 + "\n", "utf8");
+    t.refresh({ chunkBytes: 32 });
+    assert.ok(t.sessions.get("s_rot").turns.has("t2"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("findSessionByPromptInDb avoids scanning part table and finds pre-warmed draft sessions", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec(`
+      CREATE TABLE session (id text primary key, time_created integer not null, time_updated integer not null);
+      CREATE TABLE message (id text primary key, session_id text not null, time_created integer not null, data text not null, sequence integer);
+      CREATE TABLE part (id text primary key, message_id text not null, session_id text not null, time_created integer not null, data text not null, sequence integer);
+      CREATE INDEX message_session_time_created_id_idx on message(session_id, time_created, id);
+      CREATE INDEX part_session_message_sequence_idx on part(session_id, message_id, sequence);
+    `);
+
+    const tOld = 1_700_000_000_000;
+    const tSend = tOld + 600_000; // 10 minutes after draft pre-warm!
+    // Old completed session
+    db.prepare("insert into session values (?,?,?)").run("sess_old", tOld - 10_000, tOld - 5_000);
+    db.prepare("insert into message values (?,?,?,?,?)").run("m_old", "sess_old", tOld - 9_000, JSON.stringify({ role: "user" }), 0);
+    db.prepare("insert into part values (?,?,?,?,?,?)").run("p_old", "m_old", "sess_old", tOld - 9_000, JSON.stringify({ type: "text", text: "old prompt" }), 0);
+
+    // Pre-warmed draft session created 10 minutes earlier whose session.time_updated hasn't bumped yet
+    db.prepare("insert into session values (?,?,?)").run("sess_prewarm", tOld, tOld);
+    db.prepare("insert into message values (?,?,?,?,?)").run("m_new", "sess_prewarm", tSend, JSON.stringify({ role: "user" }), 0);
+    db.prepare("insert into part values (?,?,?,?,?,?)").run("p_new", "m_new", "sess_prewarm", tSend, JSON.stringify({ type: "text", text: "hello prewarmed draft" }), 0);
+
+    // Verify query plan anchors on session and index-seeks message & part (NEVER SCAN part)
+    const plan = db
+      .prepare(
+        `explain query plan
+         with recent_sessions as materialized (
+           select id from session
+            where time_updated >= ? or time_created >= ?
+           union
+           select id from (select id from session order by time_created desc limit 25)
+         )
+         select m.session_id as sid, json_extract(p.data,'$.text') as text
+           from recent_sessions rs
+           cross join message m on m.session_id = rs.id and m.time_created >= ?
+           cross join part p on p.session_id = m.session_id and p.message_id = m.id
+          where json_extract(m.data,'$.role') = 'user'
+            and json_extract(m.data,'$.metadata.visibility') is null
+            and json_extract(p.data,'$.type') = 'text'
+          order by m.time_created desc limit 20`,
+      )
+      .all(tSend - 3000, tSend - 3000, tSend - 3000)
+      .map((r) => r.detail)
+      .join(" | ");
+    assert.doesNotMatch(plan, /SCAN p\b/);
+    assert.match(plan, /message_session_time_created_id_idx/);
+    assert.match(plan, /part_session_message_sequence_idx/);
+
+    assert.equal(findSessionByPromptInDb(db, "hello prewarmed draft", tSend - 3000), "sess_prewarm");
+    assert.equal(findSessionByPromptInDb(db, "old prompt", tSend - 3000), null);
+  } finally {
+    db.close();
+  }
 });

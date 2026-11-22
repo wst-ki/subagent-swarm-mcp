@@ -58,7 +58,14 @@ export class Cdp {
     return cdp;
   }
 
+  get isOpen() {
+    return Boolean(this.#ws && this.#ws.readyState === WebSocket.OPEN);
+  }
+
   call(method, params = {}, timeout = 15_000) {
+    if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error(`CDP ${method} failed: DevTools websocket is not open`));
+    }
     return new Promise((resolve, reject) => {
       const id = ++this.#id;
       const timer = setTimeout(() => {
@@ -69,7 +76,13 @@ export class Cdp {
         resolve: (v) => (clearTimeout(timer), resolve(v)),
         reject: (e) => (clearTimeout(timer), reject(e)),
       });
-      this.#ws.send(JSON.stringify({ id, method, params }));
+      try {
+        this.#ws.send(JSON.stringify({ id, method, params }));
+      } catch (err) {
+        this.#pending.delete(id);
+        clearTimeout(timer);
+        reject(err);
+      }
     });
   }
 
@@ -152,7 +165,7 @@ export class Cdp {
 
   close() {
     try {
-      this.#ws.close();
+      this.#ws?.close();
     } catch {}
   }
 }

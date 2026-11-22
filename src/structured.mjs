@@ -386,6 +386,7 @@ export async function runStructured({
   waitSec = 0,
   fallbackModel,
   onProgress,
+  shouldAbort,
   env,
   backends,
 }) {
@@ -405,7 +406,7 @@ export async function runStructured({
     !fallbackModel &&
     !backends;
   const started = isLegacyZcodeCall
-    ? await runTask({ prompt, model, provider })
+    ? await runTask({ prompt, model, provider, shouldAbort })
     : await swarmRun({
         backend,
         prompt,
@@ -423,6 +424,7 @@ export async function runStructured({
         waitSec,
         contract: { schema, domainRule: domainRule ?? null, input },
         onProgress,
+        shouldAbort,
         env,
         backends,
       });

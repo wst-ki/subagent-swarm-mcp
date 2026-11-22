@@ -236,6 +236,7 @@ export async function swarmRun({
   waitSec = 0,
   contract = null,
   onProgress = null,
+  shouldAbort = null,
   env = process.env,
   backends = BACKENDS,
 } = {}) {
@@ -272,6 +273,7 @@ export async function swarmRun({
     appendSystemPrompt,
     addDirs,
     contract,
+    shouldAbort,
     env,
   });
 

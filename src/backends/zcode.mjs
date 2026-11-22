@@ -34,7 +34,7 @@ export function models() {
   return config.allowedModels;
 }
 
-export async function run({ prompt, model, profile, cwd, provider } = {}) {
+export async function run({ prompt, model, profile, cwd, provider, shouldAbort } = {}) {
   if (profile && profile !== "workspace") {
     throw new Error(
       `ZCode backend always runs with full workspace access and cannot enforce profile "${profile}". Use backend "codebuddy" for lite/readonly isolation.`,
@@ -45,7 +45,7 @@ export async function run({ prompt, model, profile, cwd, provider } = {}) {
       `ZCode backend is bound to configured projectDir "${config.projectDir}" and cannot switch cwd to "${cwd}".`,
     );
   }
-  const res = await runTask({ prompt, model, provider });
+  const res = await runTask({ prompt, model, provider, shouldAbort });
   return { ...res, backend: "zcode", profile: "workspace" };
 }
 

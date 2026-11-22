@@ -119,6 +119,12 @@ export function formatTaskError(evalRes) {
   return `${taskId} did not complete (status=${evalRes.status ?? 'unknown'})`;
 }
 
+export function isSubmissionBlockerMessage(msg) {
+  return /SEND_FAILED|ZCode UI rejected send|login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider.*not enabled|does not offer model|billing route|ZCODE_MCP_PROVIDERS|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(
+    String(msg ?? ''),
+  );
+}
+
 export function classifyBlocker(code, message = '') {
   switch (code) {
     case 'quota_or_rate_limit':
@@ -141,7 +147,7 @@ export function classifyBlocker(code, message = '') {
       if (/consecutive submission failures/i.test(String(message ?? ''))) {
         return {
           retryable: true,
-          recommendedAction: /zcode|v4-composer|composer-workspace|chat-mode-select/i.test(String(message ?? ''))
+          recommendedAction: /zcode|v4-composer|composer-workspace|chat-mode-select|model menu|chat-model-select|provider menu/i.test(String(message ?? ''))
             ? 'restart_zcode_ui'
             : 'inspect_backend',
         };
@@ -149,7 +155,7 @@ export function classifyBlocker(code, message = '') {
       if (/blocked by another element|open dialog or overlay|menu or popover|popover stayed open/i.test(String(message ?? ''))) {
         return { retryable: true, recommendedAction: 'dismiss_ui_overlay' };
       }
-      if (/switch to model|billing route|ZCODE_MCP_PROVIDERS|provider.*not enabled/i.test(String(message ?? ''))) {
+      if (/switch to model|billing route|ZCODE_MCP_PROVIDERS|provider.*not enabled|does not offer model/i.test(String(message ?? ''))) {
         return { retryable: false, recommendedAction: 'check_billing_route' };
       }
       if (/A ZCode dialog is open|dialog_open/i.test(String(message ?? ''))) {
@@ -469,6 +475,7 @@ export async function runStructuredBatch({
   const buildRunPayload = (base, targetRoute = activeRoute) => ({
     ...base,
     model,
+    shouldAbort: () => Boolean(blockedReason),
     ...(targetRoute ? { provider: targetRoute.encoded } : {}),
     ...(resolvedBackend !== 'zcode'
       ? {
@@ -526,6 +533,7 @@ export async function runStructuredBatch({
   }
 
   const writeProgress = (state = 'running') => {
+    const effectiveState = blockedReason && state === 'running' ? 'blocked' : state;
     let valid = 0;
     let invalid = 0;
     let failed = 0;
@@ -539,7 +547,7 @@ export async function runStructuredBatch({
     }
     writeJsonFileAtomic(progressPath, {
       batchId,
-      state,
+      state: effectiveState,
       backend: resolvedBackend,
       totalItems: manifestByKey.size,
       valid,
@@ -698,7 +706,7 @@ export async function runStructuredBatch({
           schema,
           domainRule: domainRule ?? undefined,
         }, submittedRoute));
-        consecutiveSubmissionErrors = 0;
+        if (!blockedReason) consecutiveSubmissionErrors = 0;
       } catch (err) {
         if (err?.abortedByBlocker || blockedReason) return;
         const msg = String(err?.message ?? err);
@@ -714,9 +722,7 @@ export async function runStructuredBatch({
           attempt--;
           continue;
         }
-        const isAuthOrBlocker =
-          !isCapacityExhausted &&
-          /SEND_FAILED|ZCode UI rejected send|login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
+        const isAuthOrBlocker = !isCapacityExhausted && isSubmissionBlockerMessage(msg);
         if (!isCapacityExhausted) consecutiveSubmissionErrors++;
         const hitConsecutiveLimit =
           !isCapacityExhausted &&
@@ -939,7 +945,7 @@ export async function runStructuredBatch({
           input: mbInput,
           schema: mbSchema,
         }, submittedRoute));
-        consecutiveSubmissionErrors = 0;
+        if (!blockedReason) consecutiveSubmissionErrors = 0;
       } catch (err) {
         if (err?.abortedByBlocker || blockedReason) return;
         const msg = String(err?.message ?? err);
@@ -955,9 +961,7 @@ export async function runStructuredBatch({
           attempt--;
           continue;
         }
-        const isAuthOrBlocker =
-          !isCapacityExhausted &&
-          /SEND_FAILED|ZCode UI rejected send|login|expired|sign in|dialog is open|open dialog or overlay|authentication_required|dialog_open|blocked by another element|popover stayed open|switch to model|provider|quota|rate.limit|429|credit|insufficient|额度|限流|auth/i.test(msg);
+        const isAuthOrBlocker = !isCapacityExhausted && isSubmissionBlockerMessage(msg);
         if (!isCapacityExhausted) consecutiveSubmissionErrors++;
         const hitConsecutiveLimit =
           !isCapacityExhausted &&

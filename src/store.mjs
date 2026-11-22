@@ -169,32 +169,45 @@ export class LogTailer {
     }
   }
 
-  // Reads whatever was appended to the recent log files since the last call.
-  refresh() {
+  // Reads whatever was appended to the recent log files since the last call, in bounded chunks
+  // so cold-starting on multi-hundred-MB daily logs never allocates a giant buffer.
+  refresh({ chunkBytes = 2 * 1024 * 1024 } = {}) {
     if (!existsSync(this.#dir)) return;
     const files = readdirSync(this.#dir)
       .filter((f) => /^zcode-.*\.jsonl$/.test(f))
       .sort()
       .slice(-2);
-    for (const f of files) {
-      const path = join(this.#dir, f);
+    const activePaths = new Set(files.map((f) => join(this.#dir, f)));
+    for (const trackedPath of this.#files.keys()) {
+      if (!activePaths.has(trackedPath)) this.#files.delete(trackedPath);
+    }
+    for (const path of activePaths) {
       let f_ = this.#files.get(path);
       if (!f_) this.#files.set(path, (f_ = { offset: 0, carry: Buffer.alloc(0) }));
       const size = statSync(path).size;
-      if (size < f_.offset) f_.offset = 0; // truncated / rotated
+      if (size < f_.offset) {
+        f_.offset = 0; // truncated / rotated
+        f_.carry = Buffer.alloc(0);
+      }
       if (size === f_.offset) continue;
       const fd = openSync(path, "r");
       try {
-        const buf = Buffer.alloc(size - f_.offset);
-        readSync(fd, buf, 0, buf.length, f_.offset);
-        f_.offset = size;
-        let data = Buffer.concat([f_.carry, buf]);
-        let nl;
-        while ((nl = data.indexOf(0x0a)) !== -1) {
-          this.ingestLine(data.subarray(0, nl).toString("utf8"));
-          data = data.subarray(nl + 1);
+        const readBuf = Buffer.allocUnsafe(Math.min(Math.max(1, chunkBytes), size - f_.offset));
+        while (f_.offset < size) {
+          const toRead = Math.min(readBuf.length, size - f_.offset);
+          const n = readSync(fd, readBuf, 0, toRead, f_.offset);
+          if (n <= 0) break;
+          f_.offset += n;
+          const chunk = n === readBuf.length ? readBuf : readBuf.subarray(0, n);
+          const data = f_.carry.length ? Buffer.concat([f_.carry, chunk]) : chunk;
+          let start = 0;
+          let nl;
+          while ((nl = data.indexOf(0x0a, start)) !== -1) {
+            this.ingestLine(data.subarray(start, nl).toString("utf8"));
+            start = nl + 1;
+          }
+          f_.carry = start < data.length ? Buffer.from(data.subarray(start)) : Buffer.alloc(0);
         }
-        f_.carry = Buffer.from(data);
       } finally {
         closeSync(fd);
       }
@@ -206,22 +219,36 @@ export const tailer = new LogTailer();
 
 // ------------------------------------------------------------------ queries
 
-export function findSessionByPrompt(prompt, sinceMs) {
+export function findSessionByPromptInDb(db, prompt, sinceMs) {
   const want = prompt.trim();
-  return withDb((db) => {
-    const rows = db
-      .prepare(
-        `select m.session_id as sid, json_extract(p.data,'$.text') as text
-           from message m join part p on p.message_id = m.id
-          where json_extract(m.data,'$.role') = 'user'
-            and json_extract(m.data,'$.metadata.visibility') is null
-            and json_extract(p.data,'$.type') = 'text'
-            and m.time_created >= ?
-          order by m.time_created desc limit 20`,
-      )
-      .all(sinceMs);
-    return rows.find((r) => String(r.text).trim() === want)?.sid ?? null;
-  });
+  // Force SQLite to anchor on the small `session` table first (covering both recently updated
+  // sessions and the 25 newest pre-warmed draft sessions) and then index-seek `message` and `part`,
+  // avoiding a full table scan over `part` on large (>1 GB) databases.
+  const rows = db
+    .prepare(
+      `with recent_sessions as materialized (
+         select id from session
+          where time_updated >= ? or time_created >= ?
+         union
+         select id from (
+           select id from session order by time_created desc limit 25
+         )
+       )
+       select m.session_id as sid, json_extract(p.data,'$.text') as text
+         from recent_sessions rs
+         cross join message m on m.session_id = rs.id and m.time_created >= ?
+         cross join part p on p.session_id = m.session_id and p.message_id = m.id
+        where json_extract(m.data,'$.role') = 'user'
+          and json_extract(m.data,'$.metadata.visibility') is null
+          and json_extract(p.data,'$.type') = 'text'
+        order by m.time_created desc limit 20`,
+    )
+    .all(sinceMs, sinceMs, sinceMs);
+  return rows.find((r) => String(r.text).trim() === want)?.sid ?? null;
+}
+
+export function findSessionByPrompt(prompt, sinceMs) {
+  return withDb((db) => findSessionByPromptInDb(db, prompt, sinceMs));
 }
 
 export function sessionRow(sid) {

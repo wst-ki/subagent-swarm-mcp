@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Cdp, ZcodeUnavailableError, sleep, waitFor } from "./cdp.mjs";
 import { config, paths } from "./config.mjs";
-import { withUiLock } from "./lock.mjs";
+import { UiLockAbortedError, withUiLock } from "./lock.mjs";
 import { MODEL_ITEM_PREFIX, PROVIDER_ITEM_PREFIX, normalizeProviderKey, planModelSelection, resolveProvider } from "./model-select.mjs";
 import { findSessionByPrompt, finalAnswer, listSessions, runningSessions, sessionProviderId, sessionRow, taskStatus, tailer } from "./store.mjs";
 
@@ -21,7 +21,18 @@ export async function uiBlocker(cdp) {
     const oauthCancel = typeof document.querySelector === 'function' ? document.querySelector('[data-testid="oauth-cancel"]') : null;
     if (oauthCancel && visible(oauthCancel))
       return { code: 'authentication_required', message: 'ZCode is on the login screen; complete sign-in in the ZCode window.' };
-    if (dialogs.length) return { code: 'dialog_open', message: 'A ZCode dialog is open; inspect it before submitting tasks.' };
+    if (dialogs.length) {
+      const first = dialogs[0];
+      const testId = first.getAttribute?.('data-testid') || null;
+      const snippet = (first.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 100) || null;
+      const detail = [testId ? '[' + testId + ']' : '', snippet ? JSON.stringify(snippet) : ''].filter(Boolean).join(' ');
+      return {
+        code: 'dialog_open',
+        ...(testId ? { testId } : {}),
+        ...(snippet ? { text: snippet } : {}),
+        message: 'A ZCode dialog is open' + (detail ? ' (' + detail + ')' : '') + '; inspect it before submitting tasks.',
+      };
+    }
     return null;
   })()`);
 }
@@ -168,16 +179,29 @@ function readMenuItems(cdp) {
                  checked: e.getAttribute('aria-checked') === 'true', text: (e.innerText || '').trim().slice(0, 200) }))`);
 }
 
-async function openModelMenu(cdp, { timeout = 3000, interval = 150 } = {}) {
-  await closeOpenMenu(cdp);
-  await cdp.clickTestId("chat-model-select-trigger");
-  return waitFor(
-    async () => {
-      const items = await readMenuItems(cdp);
-      return items.length > 0 ? items : null;
-    },
-    { timeout, interval, what: "model menu items to render" },
-  );
+async function openModelMenu(cdp, { timeout = 5000, interval = 150, retries = 1 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    await closeOpenMenu(cdp);
+    await cdp.clickTestId("chat-model-select-trigger");
+    try {
+      return await waitFor(
+        async () => {
+          const items = await readMenuItems(cdp);
+          return items.length > 0 ? items : null;
+        },
+        { timeout, interval, what: "model menu items to render" },
+      );
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        if (await uiBlocker(cdp)) throw err;
+        await closeOpenMenu(cdp).catch(() => {});
+        await sleep(250);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /**
@@ -252,7 +276,7 @@ export async function verifyModel(cdp, plan, { timeout = 6000, interval = 400 } 
     await waitFor(
       async () => {
         try {
-          const items = await openModelMenu(cdp, { timeout: Math.min(3000, timeout), interval: 150 });
+          const items = await openModelMenu(cdp, { timeout: Math.min(3000, timeout), interval: 150, retries: 0 });
           await closeOpenMenu(cdp);
           seen = items.find((i) => i.checked && i.testId.startsWith(MODEL_ITEM_PREFIX)) ?? null;
           lastErr = null;
@@ -410,6 +434,55 @@ export async function readComposerSendError(cdp) {
 }
 
 /**
+ * Wait (best-effort) until ZCode's renderer finishes draft-promotion for a newly sent task
+ * (`composer-workspace-trigger` unmounts once `sessionId` transitions from `null` to the new sid).
+ * Releasing `ui.lock` before this finishes lets the next queued worker click
+ * `virtual-project-create-task` mid-`project.readTree`, bumping `draftFocusVersion` and
+ * deadlocking ZCode 3.18.2's draft pre-warmer (`SEND_FAILED: 草稿会话尚未开始创建`).
+ */
+export async function waitForDraftPromotion(cdp, { timeout = 4000, interval = 150 } = {}) {
+  try {
+    await waitFor(
+      async () => !(await cdp.hasTestId("composer-workspace-trigger")),
+      { timeout, interval, what: "draft composer promotion" },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Zero-disruption self-heal for ZCode 3.18.2's deadlocked draft pre-warmer
+ * (`SEND_FAILED: 草稿会话尚未开始创建`). Clicking any visible sidebar task item moves
+ * the main pane off `sessionId === null` so React unmounts/destroys the broken draft
+ * coordinator in <1 s without reloading Electron or interrupting concurrent running tasks.
+ */
+export async function recoverDraftSession(cdp, { timeout = 4000, interval = 150 } = {}) {
+  if (await uiBlocker(cdp)) return { recovered: false, skipped: "ui_blocker" };
+  if (!(await cdp.hasTestId("composer-workspace-trigger"))) {
+    return { recovered: false, skipped: "not_in_draft" };
+  }
+  await closeOpenMenu(cdp).catch(() => {});
+  const targetExpr = `[...document.querySelectorAll('[data-testid^="task-item-"]')]
+    .find(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })`;
+  try {
+    await cdp.clickElement(targetExpr, "existing sidebar task item (draft recovery)");
+  } catch (err) {
+    return { recovered: false, skipped: "no_sidebar_task", error: err?.message ?? String(err) };
+  }
+  try {
+    await waitFor(
+      async () => !(await cdp.hasTestId("composer-workspace-trigger")),
+      { timeout, interval, what: "composer to leave deadlocked draft state" },
+    );
+    return { recovered: true, method: "sidebar_task_switch" };
+  } catch {
+    return { recovered: false, skipped: "draft_did_not_leave" };
+  }
+}
+
+/**
  * Safe CDP renderer-only reload (`Page.reload`) to self-heal a stalled ZCode Electron draft-session
  * state machine (e.g. `SEND_FAILED: 草稿会话尚未开始创建` after hours of running) without restarting
  * the ZCode process or losing login state.
@@ -452,22 +525,26 @@ export async function reloadRendererIfSafe(
     } catch {}
   }
 
+  let oldClosed = false;
+  try {
+    await cdp.call("Page.reload", { ignoreCache: false });
+  } catch (err) {
+    try {
+      cdp.close?.();
+      oldClosed = true;
+    } catch {}
+    return { reloaded: false, skipped: "reload_failed", oldClosed, error: err?.message ?? String(err) };
+  }
   if (statePath) {
     try {
       mkdirSync(dirname(statePath), { recursive: true });
       writeFileSync(statePath, JSON.stringify({ at: now, reason, pid: process.pid }), "utf8");
     } catch {}
   }
-
   try {
-    await cdp.call("Page.reload", { ignoreCache: false });
-  } catch (err) {
-    return { reloaded: false, skipped: "reload_failed", error: err?.message ?? String(err) };
-  } finally {
-    try {
-      cdp.close?.();
-    } catch {}
-  }
+    cdp.close?.();
+    oldClosed = true;
+  } catch {}
 
   if (settleMs > 0) await sleeper(settleMs);
   const deadline = nowFn() + timeoutMs;
@@ -486,7 +563,7 @@ export async function reloadRendererIfSafe(
         if (!hasProject) return false;
         return visible(document.querySelector('[data-testid="v4-composer-input"]')) || visible(document.querySelector('[data-testid="task-new-button"]'));
       })()`);
-      if (ready) return { reloaded: true, cdp: fresh };
+      if (ready) return { reloaded: true, oldClosed, cdp: fresh };
       fresh.close?.();
     } catch (err) {
       try {
@@ -496,7 +573,7 @@ export async function reloadRendererIfSafe(
     }
     await sleeper(500);
   }
-  return { reloaded: false, skipped: "reload_timeout" };
+  return { reloaded: false, skipped: "reload_timeout", oldClosed };
 }
 
 function assertCapacity() {
@@ -506,7 +583,7 @@ function assertCapacity() {
 }
 
 /** Start a new task in the subagent project. Resolves once ZCode has accepted it. */
-export async function runTask({ prompt, model, provider }) {
+export async function runTask({ prompt, model, provider, shouldAbort = null }) {
   if (!prompt?.trim()) throw new Error("prompt is empty");
   if (prompt.length > config.maxPromptChars) throw new Error(`prompt too long (${prompt.length} > ${config.maxPromptChars} chars)`);
   model ??= config.defaultModel;
@@ -517,6 +594,7 @@ export async function runTask({ prompt, model, provider }) {
   return withUiLock(async () => {
     let activeCdp = await Cdp.connect(config.cdpPort);
     const submitOnce = async (cdp) => {
+      if (typeof shouldAbort === "function" && shouldAbort()) throw new UiLockAbortedError();
       assertCapacity(); // inside the lock so concurrent submitters can't both squeeze past the limit
       await ensureWorkspace(cdp);
       // New task in the configured project (found by its sidebar label).
@@ -536,12 +614,16 @@ export async function runTask({ prompt, model, provider }) {
       }
       let project;
       try {
-        project = await waitForNewTaskComposer(cdp, { timeout: 3500 });
+        project = await waitForNewTaskComposer(cdp, { timeout: 5500 });
       } catch {
-        // A sidebar re-render during high load can swallow the first click; retry once if no dialog blocks.
-        if (await uiBlocker(cdp)) throw new ZcodeUnavailableError((await uiBlocker(cdp)).message);
+        // A sidebar re-render during high load can swallow the first click; retry once if no dialog
+        // blocks and the composer is not already showing the draft workspace trigger.
+        const blocker = await uiBlocker(cdp);
+        if (blocker) throw new ZcodeUnavailableError(blocker.message);
         await closeOpenMenu(cdp).catch(() => {});
-        await cdp.clickElement(createTaskExpr, createTaskLabel);
+        if (!(await cdp.hasTestId("composer-workspace-trigger"))) {
+          await cdp.clickElement(createTaskExpr, createTaskLabel);
+        }
         project = await waitForNewTaskComposer(cdp, { timeout: 6000 });
       }
       if (project !== config.projectName)
@@ -551,6 +633,10 @@ export async function runTask({ prompt, model, provider }) {
       await setModel(cdp, model, route.encoded);
       await typePrompt(cdp, prompt);
 
+      if (typeof shouldAbort === "function" && shouldAbort()) {
+        await clearComposer(cdp).catch(() => {});
+        throw new UiLockAbortedError();
+      }
       const t0 = Date.now();
       try {
         await waitForSendEnabled(cdp);
@@ -602,11 +688,23 @@ export async function runTask({ prompt, model, provider }) {
       }
       const row = sessionRow(sid);
       const out = { taskId: sid, model, provider: route.decoded, project: config.projectName, directory: row?.directory ?? null, mode: FULL_ACCESS };
-      // The menu can lie (a run once went to another billing route); the session's own record cannot.
-      const actual = await actualProviderId(sid);
+      // Run providerId verification and draft-promotion synchronization in parallel so we do not
+      // release ui.lock before ZCode's renderer exits draft mode (`composer-workspace-trigger` gone).
+      const [actual] = await Promise.all([actualProviderId(sid), waitForDraftPromotion(cdp)]);
       if (actual && normalizeProviderKey(actual).encoded !== route.encoded)
         out.warning = `ZCode is running this session on provider "${actual}" instead of the requested "${route.decoded}". The prompt was sent anyway; check the run's billing.`;
       return out;
+    };
+
+    const tryReloadAndRetry = async (triggerErr) => {
+      if (typeof shouldAbort === "function" && shouldAbort()) throw new UiLockAbortedError();
+      const prevCdp = activeCdp;
+      const recovery = await reloadRendererIfSafe(prevCdp, { reason: triggerErr.sendErrorCode });
+      if (recovery.oldClosed || prevCdp?.isOpen === false) activeCdp = null;
+      if (!recovery.reloaded || !recovery.cdp) throw triggerErr;
+      activeCdp = recovery.cdp;
+      const retried = await submitOnce(activeCdp);
+      return { ...retried, rendererReloaded: true };
     };
 
     try {
@@ -614,17 +712,31 @@ export async function runTask({ prompt, model, provider }) {
         return await submitOnce(activeCdp);
       } catch (err) {
         if (!err?.sendErrorCode) throw err;
-        const recovery = await reloadRendererIfSafe(activeCdp, { reason: err.sendErrorCode });
-        if (!recovery.reloaded || !recovery.cdp) throw err;
-        activeCdp = recovery.cdp;
-        const retried = await submitOnce(activeCdp);
-        return { ...retried, rendererReloaded: true };
+        if (typeof shouldAbort === "function" && shouldAbort()) throw new UiLockAbortedError();
+        // Tier 1: zero-disruption sidebar switch clears ZCode 3.18.2's deadlocked draft
+        // state machine in <1 s even while other concurrent tasks are running.
+        const draftRecovery = await recoverDraftSession(activeCdp).catch(() => ({ recovered: false }));
+        if (draftRecovery.recovered) {
+          try {
+            const retried = await submitOnce(activeCdp);
+            return { ...retried, draftSessionRecovered: true };
+          } catch (retryErr) {
+            if (!retryErr?.sendErrorCode) throw retryErr;
+            return await tryReloadAndRetry(retryErr);
+          }
+        }
+        // Tier 2: idle CDP Page.reload fallback when sidebar switch wasn't possible or didn't clear it.
+        return await tryReloadAndRetry(err);
       }
     } finally {
-      await closeOpenMenu(activeCdp).catch(() => {});
-      activeCdp.close();
+      if (activeCdp) {
+        if (activeCdp.isOpen !== false) {
+          await closeOpenMenu(activeCdp).catch(() => {});
+        }
+        activeCdp.close();
+      }
     }
-  });
+  }, { shouldAbort });
 }
 
 /** Send a follow-up message to an existing (finished) task. */

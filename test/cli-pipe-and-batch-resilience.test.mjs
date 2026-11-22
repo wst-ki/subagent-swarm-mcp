@@ -4,8 +4,9 @@ import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { classifyBlocker, exportBatchValidItems, readBatchStatus, runStructuredBatch } from "../src/batch.mjs";
+import { classifyBlocker, exportBatchValidItems, isSubmissionBlockerMessage, readBatchStatus, runStructuredBatch } from "../src/batch.mjs";
 import { readTextFileWithRetry } from "../src/cli-io.mjs";
+import { UiLockAbortedError, withUiLock } from "../src/lock.mjs";
 import { SECTION_OUTLINE_SCHEMA } from "../src/structured.mjs";
 
 function makeTempDir(prefix = "cli-resilience-") {
@@ -928,5 +929,106 @@ test("batch halts with restart_zcode_ui breaker after consecutive submission fai
     assert.equal(resumedCalls, 5);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("v0.3.8: withUiLock honors shouldAbort and token ownership; queued batch workers never overwrite blocked progress", async () => {
+  // Part A: classifyBlocker & isSubmissionBlockerMessage handle model/provider menu timeouts cleanly
+  assert.equal(isSubmissionBlockerMessage("Timed out waiting for model menu items to render"), false);
+  assert.equal(isSubmissionBlockerMessage("Timed out waiting for provider menu items to render"), false);
+  assert.equal(isSubmissionBlockerMessage("Provider account:foo does not offer model GLM-5.3 in ZCode's model menu."), true);
+  assert.deepEqual(
+    classifyBlocker("submission_circuit_breaker", "Halted after 3 consecutive submission failures (last: Timed out waiting for model menu items to render)"),
+    { retryable: true, recommendedAction: "restart_zcode_ui" },
+  );
+  assert.deepEqual(
+    classifyBlocker("submission_circuit_breaker", "Halted after 3 consecutive submission failures (last: Timed out waiting for provider menu items to render)"),
+    { retryable: true, recommendedAction: "restart_zcode_ui" },
+  );
+  assert.deepEqual(
+    classifyBlocker("submission_circuit_breaker", "Provider account:foo does not offer model GLM-5.3 in ZCode's model menu."),
+    { retryable: false, recommendedAction: "check_billing_route" },
+  );
+
+  // Part B: withUiLock aborts queued waiter immediately when shouldAbort flips true, and preserves foreign token
+  const tmp = makeTempDir("ui-lock-abort-");
+  try {
+    const lockDir = join(tmp, "ui.lock");
+    mkdirSync(lockDir);
+    writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, token: "foreign-owner", at: Date.now() }));
+
+    let abortFlag = false;
+    setTimeout(() => {
+      abortFlag = true;
+    }, 30);
+    const t0 = Date.now();
+    await assert.rejects(
+      withUiLock(async () => "never", {
+        lockDir,
+        pollMs: 10,
+        timeout: 10_000,
+        shouldAbort: () => abortFlag,
+      }),
+      (err) => err instanceof UiLockAbortedError && err.abortedByBlocker === true,
+    );
+    assert.ok(Date.now() - t0 < 1000);
+    // Foreign lock must still exist untouched!
+    assert.equal(JSON.parse(readFileSync(join(lockDir, "owner.json"), "utf8")).token, "foreign-owner");
+
+    // Part C: Concurrent batch workers (maxConcurrency=2) — worker 1 trips SEND_FAILED while worker 2
+    // is queued on ui.lock; worker 2 aborts cleanly, and an already-running worker finishing later must
+    // NOT overwrite progress.json state from "blocked" back to "running".
+    const stateDir = join(tmp, "state");
+    const batchLockDir = join(tmp, "batch-ui.lock");
+    let runnerCalls = 0;
+    let releaseHolder;
+    const holderDone = new Promise((r) => (releaseHolder = r));
+    const res = await runStructuredBatch({
+      batchId: "concurrent-abort-1",
+      task: "Classify headings",
+      schema: SECTION_OUTLINE_SCHEMA,
+      provider: "account:bigmodel-start-plan",
+      maxConcurrency: 2,
+      maxRetries: 0,
+      items: [
+        { itemId: "a1", input: { expected: [1] } },
+        { itemId: "a2", input: { expected: [1] } },
+        { itemId: "a3", input: { expected: [1] } },
+      ],
+      stateDir,
+      runner: async ({ input, shouldAbort }) => {
+        const call = ++runnerCalls;
+        if (call === 1) {
+          // Worker 1 holds lock briefly while Worker 2 queues behind it, then throws SEND_FAILED
+          return withUiLock(
+            async () => {
+              await new Promise((r) => setTimeout(r, 40));
+              throw new Error("ZCode UI rejected send (SEND_FAILED): 草稿会话尚未开始创建");
+            },
+            { lockDir: batchLockDir, pollMs: 10, shouldAbort },
+          );
+        }
+        // Worker 2 queues behind Worker 1 on ui.lock and MUST abort via shouldAbort without submitting!
+        return withUiLock(
+          async () => {
+            releaseHolder?.();
+            return { taskId: `session_should_not_run_${input.expected}` };
+          },
+          { lockDir: batchLockDir, pollMs: 10, shouldAbort },
+        );
+      },
+      evaluator: async () => ({ status: "pending", structuredStatus: "pending" }),
+      sleeper: async () => {},
+    });
+    assert.equal(res.status, "blocked");
+    assert.equal(res.blocked.code, "submission_circuit_breaker");
+    assert.equal(res.blocked.recommendedAction, "restart_zcode_ui");
+    assert.equal(res.counts.failed, 1); // Only a1 failed; a2 and a3 stayed cleanly pending!
+    assert.equal(res.counts.pending, 2);
+    const prog = JSON.parse(readFileSync(join(stateDir, "batches", "concurrent-abort-1", "progress.json"), "utf8"));
+    assert.equal(prog.state, "blocked");
+    void holderDone;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
   }
 });

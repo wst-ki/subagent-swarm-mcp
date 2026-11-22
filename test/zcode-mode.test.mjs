@@ -4,7 +4,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInNewContext } from "node:vm";
-import { closeOpenMenu, readComposerSendError, reloadRendererIfSafe, setMode, setModel, waitForNewTaskComposer, waitForSendEnabled } from "../src/zcode.mjs";
+import {
+  closeOpenMenu,
+  readComposerSendError,
+  recoverDraftSession,
+  reloadRendererIfSafe,
+  setMode,
+  setModel,
+  waitForDraftPromotion,
+  waitForNewTaskComposer,
+  waitForSendEnabled,
+} from "../src/zcode.mjs";
 
 function makeFakeCdp({ initialMode = "变更前确认", withDialog = false, stayDisabled = false } = {}) {
   let mode = initialMode;
@@ -463,7 +473,117 @@ test("reloadRendererIfSafe skips when tasks run or within cooldown, reloads clea
       }),
       /login has expired/i,
     );
+
+    // 5. If Page.reload RPC itself fails (e.g. closed socket), must NOT burn cooldown state and reports oldClosed=true
+    const statePath2 = join(dir, "reload-failed-no-cooldown.json");
+    const brokenOld = {
+      closed: false,
+      async call() {
+        throw new Error("CDP Page.reload failed: DevTools websocket is not open");
+      },
+      close() {
+        this.closed = true;
+      },
+    };
+    const failed = await reloadRendererIfSafe(brokenOld, {
+      statePath: statePath2,
+      cooldownMs: 120_000,
+      settleMs: 0,
+      runningSessionsFn: () => [],
+      nowFn: () => now,
+      sleeper: async () => {},
+    });
+    assert.equal(failed.reloaded, false);
+    assert.equal(failed.skipped, "reload_failed");
+    assert.equal(failed.oldClosed, true);
+    assert.equal(brokenOld.closed, true);
+
+    // Next attempt immediately after a pre-dispatch failure is NOT blocked by cooldown
+    const okAfterFail = await reloadRendererIfSafe(makeOldCdp(), {
+      statePath: statePath2,
+      projectName: "subagent",
+      cooldownMs: 120_000,
+      settleMs: 0,
+      runningSessionsFn: () => [],
+      connectFn: async () => makeFreshCdp({ ready: true }),
+      nowFn: () => now + 1000,
+      sleeper: async () => {},
+    });
+    assert.equal(okAfterFail.reloaded, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("waitForDraftPromotion and recoverDraftSession prevent and heal ZCode 3.18.2 draft deadlock", async () => {
+  // Part A: waitForDraftPromotion resolves true once composer-workspace-trigger disappears, false on timeout (never throws)
+  let checks = 0;
+  const promotingCdp = {
+    async hasTestId(id) {
+      if (id !== "composer-workspace-trigger") return false;
+      checks++;
+      return checks < 3;
+    },
+  };
+  assert.equal(await waitForDraftPromotion(promotingCdp, { timeout: 1000, interval: 5 }), true);
+  assert.equal(checks, 3);
+
+  const stuckCdp = { async hasTestId() { return true; } };
+  assert.equal(await waitForDraftPromotion(stuckCdp, { timeout: 30, interval: 5 }), false);
+
+  // Part B: recoverDraftSession clicks a visible sidebar task item and waits for draft mode to exit
+  let inDraft = true;
+  const clicked = [];
+  const recCdp = {
+    async hasTestId(id) {
+      return id === "composer-workspace-trigger" ? inDraft : false;
+    },
+    async clickElement(_expr, what) {
+      clicked.push(what);
+      inDraft = false;
+    },
+    async evaluate(expression) {
+      return runInNewContext(expression, {
+        document: {
+          querySelector: () => null,
+          querySelectorAll: () => [],
+          body: { style: { pointerEvents: "" } },
+        },
+      });
+    },
+  };
+  const recovered = await recoverDraftSession(recCdp, { timeout: 500, interval: 5 });
+  assert.deepEqual(recovered, { recovered: true, method: "sidebar_task_switch" });
+  assert.equal(clicked.length, 1);
+
+  // When not in draft mode, recoverDraftSession skips without clicking anything
+  const notDraft = await recoverDraftSession(recCdp, { timeout: 500, interval: 5 });
+  assert.deepEqual(notDraft, { recovered: false, skipped: "not_in_draft" });
+  assert.equal(clicked.length, 1);
+});
+
+test("setModel retries once when first model menu click fails to render items", async () => {
+  const wantedId = "chat-model-select-item-custom:account%3Abigmodel-individual-coding-plan:GLM-5.3-Flash";
+  let triggerClicks = 0;
+  const flaky = makeMenuCdp({
+    modelItems: [{ testId: wantedId, checked: true, text: "GLM-5.3-Flash" }],
+  });
+  const origClickTestId = flaky.clickTestId.bind(flaky);
+  const origEvaluate = flaky.evaluate.bind(flaky);
+  flaky.clickTestId = async (id, options) => {
+    if (id === "chat-model-select-trigger") triggerClicks++;
+    return origClickTestId(id, options);
+  };
+  flaky.evaluate = async (expr) => {
+    // First open renders 0 menu items; second open renders normally!
+    if (triggerClicks === 1 && expr.includes("menuitemradio")) return [];
+    return origEvaluate(expr);
+  };
+  const plan = await setModel(flaky, "GLM-5.3-Flash", "account%3Abigmodel-individual-coding-plan", {
+    allowedProviders: ["account%3Abigmodel-individual-coding-plan"],
+    stepDelayMs: 1,
+  });
+  assert.equal(plan.status, "already-selected");
+  assert.equal(triggerClicks, 2);
+  assert.equal(flaky.isMenuOpen, false);
 });

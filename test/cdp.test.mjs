@@ -48,7 +48,11 @@ test("clickElement reports disabled / pointer-events:none instead of false overl
 });
 
 test("authentication and other dialogs are reported without interaction", async () => {
-  const visible = (text = "") => ({ innerText: text, getBoundingClientRect: () => ({ width: 10, height: 10 }) });
+  const visible = (text = "", testId = null) => ({
+    innerText: text,
+    getAttribute: (k) => (k === "data-testid" ? testId : null),
+    getBoundingClientRect: () => ({ width: 10, height: 10 }),
+  });
   const inspect = (dialogs, oauth = null) => uiBlocker({
     evaluate: async expression => runInNewContext(expression, { document: {
       querySelectorAll: () => dialogs,
@@ -57,6 +61,21 @@ test("authentication and other dialogs are reported without interaction", async 
   });
   assert.equal((await inspect([visible("登录已过期")])).code, "authentication_required");
   assert.equal((await inspect([], visible())).code, "authentication_required");
-  assert.equal((await inspect([visible("Other dialog")])).code, "dialog_open");
+  const generic = await inspect([visible("Update 3.19.1 available", "update-dialog")]);
+  assert.equal(generic.code, "dialog_open");
+  assert.equal(generic.testId, "update-dialog");
+  assert.equal(generic.text, "Update 3.19.1 available");
+  assert.match(generic.message, /\[update-dialog\].*Update 3\.19\.1 available/);
   assert.equal(await inspect([]), null);
+});
+
+test("Cdp.call rejects immediately instead of hanging 15s when websocket is not open", async () => {
+  const cdp = new Cdp();
+  assert.equal(cdp.isOpen, false);
+  const t0 = Date.now();
+  await assert.rejects(
+    cdp.call("Runtime.evaluate", { expression: "1" }, 15_000),
+    /DevTools websocket is not open/,
+  );
+  assert.ok(Date.now() - t0 < 500, "closed socket must reject immediately without waiting for timeout");
 });
